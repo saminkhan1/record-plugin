@@ -1,0 +1,10 @@
+name: hermes-crunch
+version: "0.1.0"
+description: Record a desktop workflow, draft it for review, and install it as a Hermes scheduled job.
+provides_tools:
+  - crunch_read_evidence
+  - crunch_skills_list
+  - crunch_skill_view
+  - crunch_check_requirements
+provides_hooks:
+  - pre_tool_call

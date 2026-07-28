@@ -1,0 +1,14 @@
+{
+  "name": "hermes-chrome-capture",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Hermes Crunch adaptive Chrome provider extension.",
+  "scripts": {
+    "check": "node --check src/background.js && node --check src/causality.js && node --check src/popup.js && node --check src/user-events.js",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "jsdom": ">=29.1.1 <30"
+  }
+}

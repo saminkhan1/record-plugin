@@ -1,0 +1,14 @@
+{
+  "name": "hermes-crunch",
+  "label": "Workflows",
+  "description": "Record, review, schedule, and support Hermes Crunch workflows",
+  "icon": "Workflow",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/workflows",
+    "position": "after:cron"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

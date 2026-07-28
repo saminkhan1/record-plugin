@@ -1,0 +1,11 @@
+{
+  "name": "hermes-crunch-plugin",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build:dashboard": "node scripts/build-dashboard.mjs",
+    "test:dashboard": "node --test dashboard/test/*.test.js",
+    "test:chrome": "npm --prefix chrome_capture/extension test",
+    "test": "npm run test:dashboard && npm run test:chrome"
+  }
+}

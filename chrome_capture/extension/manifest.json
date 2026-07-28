@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Hermes Chrome Provider BETA",
+  "version": "0.2.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAshmJSZTae7CGbmMdYT1gUpva5JiHjQL3pnvBUN0m/rspdPZkxJnL+b0TqW+YCeTx4t9B6evVPCvAUAEFA5o+XhvBI15lI/fo+6j4G+2SZpChJstue9G+xRuU+UUBRw2uCVAioBMDRwr9ogD94XxryDg3ZXYZebz1pOGM3JsA75V5JyAkG2TYihbRnws4gr1ikuJpJcFGnIPcqy9jTOxn1NNfPkWqhmdtNS0FzxTWEyxE/8sLHC+WY/1cOZTFp5HjN5NGTHjkB1ctb4HMTaGSRt77axfYBJACuJPGlDxZeg77Ixl0tDGx3t3YcpFFLxvGHde7+LEVF3NiAsGIKp6iRQIDAQAB",
+  "description": "THIS EXTENSION IS FOR BETA TESTING. Capture active Chrome workflow actions into a local Hermes recording for review.",
+  "icons": {
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["tabs", "webNavigation", "scripting", "downloads", "alarms", "storage", "nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/causality.js", "src/user-events.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "Hermes Chrome Provider",
+    "default_icon": {
+      "128": "icons/icon128.png"
+    },
+    "default_popup": "src/popup.html"
+  }
+}
