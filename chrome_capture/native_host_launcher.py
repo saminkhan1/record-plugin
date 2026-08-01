@@ -138,6 +138,29 @@ def _registered_extension_identity(hermes_root: Path) -> tuple[str, str] | None:
     return extension_id, version
 
 
+def _runtime_receipt_allowed(receipt: dict, profile_name: str, extension_identity: tuple[str, str]) -> bool:
+    """Allow a release install or the explicitly marked local dev install.
+
+    ``npm start`` intentionally uses an ad-hoc recorder so developers can run
+    the complete local flow without a Developer ID certificate.  The native
+    host still needs the same receipt, path, profile, and extension identity
+    checks as a release install; only the release-signing requirement differs.
+    """
+    if receipt.get("schemaVersion") not in (2, 3):
+        return False
+    if receipt.get("release") is True:
+        return True
+    return (
+        receipt.get("release") is False
+        and receipt.get("chromeMode") == "local"
+        and receipt.get("signingIdentity") == "adhoc"
+        and receipt.get("notarizationStatus") == "not-applicable-dev"
+        and receipt.get("chromeExtensionId") == extension_identity[0]
+        and receipt.get("chromeExtensionVersion") == extension_identity[1]
+        and receipt.get("profile") == profile_name
+    )
+
+
 def _active_profile_home(hermes_root: Path) -> Path | None:
     active_path = hermes_root / "record" / "chrome-capture-active.json"
     if active_path.is_symlink() or _safe_resolve(active_path) != active_path:
@@ -190,13 +213,9 @@ def _candidate_native_host(
         receipt = _read_object(receipt_path)
         if (
             receipt is None
-            or receipt.get("schemaVersion") not in (2, 3)
-            or receipt.get("release") is not True
+            or not _runtime_receipt_allowed(receipt, profile_name, extension_identity)
             or receipt.get("platform") != "darwin"
             or receipt.get("arch") != "arm64"
-            or receipt.get("profile") != profile_name
-            or receipt.get("chromeExtensionId") != extension_identity[0]
-            or receipt.get("chromeExtensionVersion") != extension_identity[1]
         ):
             return None
 

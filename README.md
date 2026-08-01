@@ -102,7 +102,9 @@ Record could use to present them as supported.
 Chrome registration is machine-wide. Its native-messaging manifest points to
 a small launcher under the Hermes root at `~/.hermes/record/chrome-provider/`.
 The launcher uses Hermes' existing Python only as an interpreter. It accepts
-only receipt-authorized profile installs whose extension ID and version match
+receipt-authorized release installs, plus the explicitly marked local
+`release:false`/`chromeMode:local`/`signingIdentity:adhoc` receipt emitted by
+`npm start`; in both cases the extension ID and version must match
 the machine registration and refuses to select a host without an active
 Desktop recording. The native host follows the one global
 active-recording pointer, whose payload identifies the profile home and
