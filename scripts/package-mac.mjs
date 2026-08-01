@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { runtimeFiles } from './runtime-files.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const finalOutputRoot = path.join(repoRoot, 'dist', 'macos-arm64')
@@ -27,38 +28,6 @@ const recorderRoot = path.join(repoRoot, 'dist', 'recorder-macos-arm64')
 process.on('exit', () => {
   fs.rmSync(outputRoot, { recursive: true, force: true })
 })
-
-const runtimeFiles = [
-  '__init__.py',
-  'plugin.yaml',
-  'chrome_capture.py',
-  'record_recorder.py',
-  'hermes_recorder.py',
-  'recording_bundle.py',
-  'record/__init__.py',
-  'record/compiler.py',
-  'record/drafting.py',
-  'record/evidence.py',
-  'record/hermes.py',
-  'record/recording.py',
-  'record/review_receipt.py',
-  'record/runtime.py',
-  'record/trace_schema.py',
-  'dashboard/manifest.json',
-  'dashboard/plugin_api.py',
-  'dashboard/dist/index.js',
-  'chrome_capture/install_native_host.py',
-  'chrome_capture/native_host_launcher.py',
-  'chrome_capture/native_host.py',
-  'chrome_capture/extension/manifest.json',
-  'chrome_capture/extension/store-identity.json',
-  'chrome_capture/extension/icons/icon128.png',
-  'chrome_capture/extension/src/background.js',
-  'chrome_capture/extension/src/causality.js',
-  'chrome_capture/extension/src/popup.html',
-  'chrome_capture/extension/src/popup.js',
-  'chrome_capture/extension/src/user-events.js'
-]
 
 function sha256(target) {
   return createHash('sha256').update(fs.readFileSync(target)).digest('hex')

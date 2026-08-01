@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "start": "node scripts/dev.mjs",
+    "start:build-only": "node scripts/dev.mjs --build-only",
     "build": "npm run build:dashboard && npm run build:desktop",
     "build:dashboard": "node scripts/build-dashboard.mjs",
     "build:desktop": "npm --prefix desktop-plugin run build",

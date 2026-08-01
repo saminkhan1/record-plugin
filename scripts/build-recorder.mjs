@@ -43,6 +43,9 @@ function signingIdentities() {
 
 function signingIdentity({ release }) {
   const configured = String(process.env.HERMES_RECORDER_SIGNING_IDENTITY || '').trim()
+  const allowAdhocDevelopment =
+    !release && process.env.HERMES_RECORDER_ALLOW_ADHOC_DEV === '1'
+  if (!configured && allowAdhocDevelopment) return '-'
   const identities = signingIdentities()
   let identity = configured
 
@@ -182,7 +185,7 @@ const receipt = {
   arch: 'arm64',
   configuration,
   release,
-  signingIdentity: identity,
+  signingIdentity: identity === '-' ? 'adhoc' : identity,
   teamId,
   identifiers: {
     client: clientIdentifier,

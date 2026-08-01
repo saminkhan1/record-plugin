@@ -135,6 +135,30 @@ vendors or patches a Hermes runtime during installation.
 
 ## Build the Mac package
 
+For a clean local build, default-home install, and Hermes Desktop launch, use
+one command from this repository:
+
+```bash
+npm start
+```
+
+That command removes generated Record and Desktop-plugin outputs, runs the
+Python and Chrome tests, builds the dashboard, Desktop plugin, and signed Swift
+recorder, installs Record into the existing default `~/.hermes` home, refreshes
+the Chrome native-host registration, clean-builds Hermes Desktop, and launches
+it. It does not create a Hermes profile or delete recordings. Local `npm start`
+builds use an ad-hoc recorder signature when
+`HERMES_RECORDER_SIGNING_IDENTITY` is unset, so macOS can require permission
+approval after a clean rebuild. Set that variable to a usable stable identity
+to preserve the recorder's privacy identity across builds. Release packaging
+still requires a timestamped Developer ID signature and never uses the local
+ad-hoc fallback. Use
+`npm run start:build-only` for the identical clean build and installation
+without launching Desktop.
+
+The unavoidable manual steps remain granting macOS permissions, publishing or
+updating the Chrome Web Store extension, and performing the actual recording.
+
 Build the web and Desktop surfaces without native packaging:
 
 ```bash
