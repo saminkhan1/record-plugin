@@ -7,21 +7,19 @@ const CHECKPOINT_KEY = "hermesChromeProviderCheckpoint";
 const ACTION_OUTBOX_KEY = "hermesChromeActionOutbox";
 const HEARTBEAT_MS = 3000;
 const AUTO_SCREENSHOT_DELAY_MS = 350;
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const CONTENT_SCRIPT_VERSION = 4;
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 const NATIVE_SCHEMA_VERSION = "hermes-chrome-provider-v1";
-const LIVE_JOIN_RETRY_INTERVAL_MS = 150;
 const INACTIVE_CONTENT_PROBE_INTERVAL_MS = 1000;
 const STATUS_ALARM_MINUTES = 0.5;
+const DESKTOP_AUTHORITY_POLL_MS = 1000;
 
 const state = {
   chromeSegmentActive: false,
   captureConsentArmed: false,
-  captureConsentOwnerTabId: null,
   captureAuthorizationEpoch: 0,
   captureAuthorization: "",
-  captureDashboardOrigin: "",
   authorizedRecordingId: "",
   captureAuthorityRevision: 0,
   recordingId: "",
@@ -34,10 +32,9 @@ const state = {
   screenshotTimer: null,
   pendingScreenshot: null,
   screenshotPromise: Promise.resolve(),
-  joinRetryTimer: null,
-  joinRetryOwnerTabId: null,
   lastInactiveContentProbeAt: 0,
   providerSequence: 0,
+  desktopFinalizeRequestId: "",
 };
 
 let nativePort = null;
@@ -47,6 +44,8 @@ const captureAuthorityPorts = new Set();
 let actionOutboxChain = Promise.resolve();
 let checkpointWriteChain = Promise.resolve();
 let startupPromise = Promise.resolve();
+let desktopAuthoritySyncPromise = null;
+let desktopAuthorityTimer = null;
 
 function correlationId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -98,7 +97,6 @@ function captureAuthorityActive() {
     && state.recordingId
     && state.segmentId
     && /^[0-9a-f]{64}$/.test(state.captureAuthorization)
-    && isLoopbackDashboardOrigin(state.captureDashboardOrigin)
     && state.authorizedRecordingId === state.recordingId
   );
 }
@@ -161,9 +159,8 @@ async function clearCaptureAuthorization({
     : "";
   state.captureAuthorizationEpoch += 1;
   state.captureConsentArmed = false;
-  state.captureConsentOwnerTabId = null;
   state.captureAuthorization = "";
-  state.captureDashboardOrigin = "";
+  state.desktopFinalizeRequestId = "";
   state.authorizedRecordingId = authorizedRecordingId;
   state.chromeSegmentActive = false;
   state.recordingId = recordingId;
@@ -171,7 +168,6 @@ async function clearCaptureAuthorization({
   state.activeTarget = null;
   state.contentScriptReady = false;
   resetSegmentFreshness();
-  clearJoinRetry();
   clearInterval(state.heartbeatTimer);
   state.heartbeatTimer = null;
   clearTimeout(state.screenshotTimer);
@@ -185,16 +181,14 @@ async function clearCaptureAuthorization({
   if (preserveRecordingScope && recordingId) {
     await chrome.storage.local.set({
       [CHECKPOINT_KEY]: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         recordingId,
         segmentId: "",
         activeTarget: null,
         lastNativeHeartbeatAt: 0,
         providerSequence: state.providerSequence,
         authorizedRecordingId,
-        captureConsentOwnerTabId: null,
         captureAuthorization: "",
-        captureDashboardOrigin: "",
       },
     });
     if (clearOutbox) await chrome.storage.local.remove(ACTION_OUTBOX_KEY);
@@ -346,7 +340,7 @@ function segmentPayload(tab, reason = "heartbeat") {
     contentScriptReady: state.contentScriptReady,
     contentScriptUpdatedAt: nowIso(),
     captureAuthorization: state.captureAuthorization,
-    dashboardOrigin: state.captureDashboardOrigin,
+    captureAuthoritySource: "desktop",
     ...activeTargetSummary(),
   };
 }
@@ -354,16 +348,14 @@ function segmentPayload(tab, reason = "heartbeat") {
 function writeCheckpoint() {
   const authorizationEpoch = state.captureAuthorizationEpoch;
   const checkpoint = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     recordingId: state.recordingId,
     segmentId: state.segmentId,
     activeTarget: state.activeTarget,
     lastNativeHeartbeatAt: state.lastNativeHeartbeatAt,
     providerSequence: state.providerSequence,
     authorizedRecordingId: state.authorizedRecordingId,
-    captureConsentOwnerTabId: state.captureConsentOwnerTabId,
     captureAuthorization: state.captureAuthorization,
-    captureDashboardOrigin: state.captureDashboardOrigin,
   };
   checkpointWriteChain = checkpointWriteChain.catch(() => {}).then(async () => {
     if (!captureConsentCurrent(authorizationEpoch)) return;
@@ -379,7 +371,7 @@ function writeCheckpoint() {
 async function restoreCheckpoint() {
   try {
     const value = await chrome.storage.local.get([CHECKPOINT_KEY, ACTION_OUTBOX_KEY]);
-    const checkpoint = value?.[CHECKPOINT_KEY]?.schemaVersion === 3
+    const checkpoint = value?.[CHECKPOINT_KEY]?.schemaVersion === 4
       ? value[CHECKPOINT_KEY]
       : null;
     if (checkpoint?.activeTarget) state.activeTarget = checkpoint.activeTarget;
@@ -397,14 +389,8 @@ async function restoreCheckpoint() {
     ) {
       state.authorizedRecordingId = checkpoint.authorizedRecordingId;
     }
-    if (Number.isInteger(checkpoint?.captureConsentOwnerTabId)) {
-      state.captureConsentOwnerTabId = checkpoint.captureConsentOwnerTabId;
-    }
     if (/^[0-9a-f]{64}$/.test(String(checkpoint?.captureAuthorization || ""))) {
       state.captureAuthorization = checkpoint.captureAuthorization;
-    }
-    if (isLoopbackDashboardOrigin(checkpoint?.captureDashboardOrigin)) {
-      state.captureDashboardOrigin = checkpoint.captureDashboardOrigin;
     }
     const storedOutbox = value?.[ACTION_OUTBOX_KEY];
     const queued = storedOutbox?.recordingId === state.recordingId && Array.isArray(storedOutbox.rows)
@@ -417,45 +403,6 @@ async function restoreCheckpoint() {
   } catch {
     // Storage is best-effort.
   }
-}
-
-async function restoreCaptureAuthorization() {
-  if (
-    !state.authorizedRecordingId
-    || state.authorizedRecordingId !== state.recordingId
-    || !Number.isInteger(state.captureConsentOwnerTabId)
-    || !/^[0-9a-f]{64}$/.test(state.captureAuthorization)
-    || !isLoopbackDashboardOrigin(state.captureDashboardOrigin)
-  ) {
-    const ownerlessRecoveryScope = !!state.recordingId
-      && state.authorizedRecordingId === state.recordingId
-      && !Number.isInteger(state.captureConsentOwnerTabId)
-      && !state.captureAuthorization
-      && !state.captureDashboardOrigin;
-    await clearCaptureAuthorization({
-      preserveRecordingScope: ownerlessRecoveryScope,
-    });
-    return;
-  }
-  const native = await nativeOptional("status");
-  const captureState = native?.captureState || {};
-  const nativeRecordingId = String(
-    captureState.sessionID
-    || native?.recordingId
-    || "",
-  );
-  if (
-    !nativeIdentityMatches(native)
-    || native?.active !== true
-    || captureState.sessionActive !== true
-    || nativeRecordingId !== state.authorizedRecordingId
-  ) {
-    await clearCaptureAuthorization({ clearOutbox: true });
-    return;
-  }
-  state.captureAuthorizationEpoch += 1;
-  state.captureConsentArmed = true;
-  await ensureSegment("authorized_worker_restore");
 }
 
 async function probeUserEvents(tabId) {
@@ -471,58 +418,6 @@ function sameTarget(left, right) {
   return !!left && !!right && left.tabId === right.tabId && left.windowId === right.windowId && left.url === right.url;
 }
 
-function isTrustedDashboardUrl(value) {
-  try {
-    const url = new URL(value || "");
-    return url.protocol === "http:"
-      && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
-      && url.pathname === "/workflows";
-  } catch {
-    return false;
-  }
-}
-
-function dashboardOriginForSender(sender) {
-  if (!isTrustedDashboardSender(sender)) return "";
-  try {
-    return new URL(sender.tab.url).origin;
-  } catch {
-    return "";
-  }
-}
-
-function isLoopbackDashboardOrigin(value) {
-  try {
-    const url = new URL(String(value || ""));
-    return url.protocol === "http:"
-      && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
-      && !!url.port
-      && !url.username
-      && !url.password
-      && String(value) === url.origin;
-  } catch {
-    return false;
-  }
-}
-
-function isTrustedDashboardSender(sender) {
-  return Number.isInteger(sender?.tab?.id) && isTrustedDashboardUrl(sender.tab.url);
-}
-
-function captureOwnedBySender(sender) {
-  const origin = dashboardOriginForSender(sender);
-  return !!origin
-    && sender?.tab?.id === state.captureConsentOwnerTabId
-    && isLoopbackDashboardOrigin(origin)
-    && origin === state.captureDashboardOrigin;
-}
-
-function clearJoinRetry() {
-  if (state.joinRetryTimer) clearTimeout(state.joinRetryTimer);
-  state.joinRetryTimer = null;
-  state.joinRetryOwnerTabId = null;
-}
-
 function resetSegmentState() {
   state.chromeSegmentActive = false;
   state.segmentId = "";
@@ -531,7 +426,6 @@ function resetSegmentState() {
   clearInterval(state.heartbeatTimer);
   state.heartbeatTimer = null;
   actionCausality.clear();
-  if (state.joinRetryOwnerTabId == null) clearJoinRetry();
   publishCaptureAuthority();
   void writeCheckpoint();
 }
@@ -614,14 +508,11 @@ async function syncSegment(reason = "ensure") {
       console.warn("Hermes Chrome Provider outbox flush failed", error);
     }
   } else if (response) {
-    // An inactive native response is authoritative, but a prepare request may
-    // intentionally arrive just before the backend recording exists. Keep the
-    // requested join alive across that ordering window.
+    // An inactive native response is authoritative.
     resetSegmentState();
   } else {
-    // A transport failure is not proof that the recording ended. Revoke the
-    // dead owner while retaining the recording/outbox scope so a visible
-    // Workflows tab can authorize a fresh segment.start.
+    // A transport failure revokes authority while retaining the recording
+    // identity long enough for Desktop to reconcile the native host.
     await clearCaptureAuthorization({
       preserveRecordingScope: !!state.recordingId,
     });
@@ -642,79 +533,79 @@ async function ensureSegment(reason = "ensure") {
   return state.ensurePromise;
 }
 
-function runJoinRetry(ownerTabId) {
-  const retry = async () => {
-    if (state.joinRetryOwnerTabId !== ownerTabId) return;
-    state.joinRetryTimer = null;
-    try {
-      await ensureSegment("recording_start_requested");
-    } catch (error) {
-      console.warn("Hermes Chrome Provider join retry failed", error);
-    }
-    if (state.chromeSegmentActive || state.joinRetryOwnerTabId !== ownerTabId) {
-      if (state.joinRetryOwnerTabId === ownerTabId) clearJoinRetry();
-      await writeCheckpoint();
-      return;
-    }
-    state.joinRetryTimer = setTimeout(retry, LIVE_JOIN_RETRY_INTERVAL_MS);
-  };
-  void retry();
-}
-
-function armJoinRetry(ownerTabId, captureAuthorization, dashboardOrigin) {
-  const normalizedAuthorization = String(captureAuthorization || "").trim().toLowerCase();
+async function applyDesktopCaptureAuthority(nativeStatus) {
+  const desktop = nativeStatus?.desktopCaptureAuthority;
   if (
-    !Number.isInteger(ownerTabId)
-    || !/^[0-9a-f]{64}$/.test(normalizedAuthorization)
-    || !isLoopbackDashboardOrigin(dashboardOrigin)
+    !nativeIdentityMatches(nativeStatus)
+    || nativeStatus?.active !== true
+    || desktop?.active !== true
+    || desktop?.source !== "desktop"
   ) {
-    return false;
-  }
-  if (state.captureConsentArmed) {
     if (
-      state.captureConsentOwnerTabId !== ownerTabId
-      || state.captureAuthorization !== normalizedAuthorization
-      || state.captureDashboardOrigin !== dashboardOrigin
-    ) return false;
-    if (!state.chromeSegmentActive && state.joinRetryOwnerTabId == null) {
-      state.joinRetryOwnerTabId = ownerTabId;
-      runJoinRetry(ownerTabId);
+      state.captureConsentArmed
+      && nativeStatus
+    ) {
+      await clearCaptureAuthorization({ clearOutbox: true });
     }
-    return true;
+    return;
   }
-  if (state.joinRetryOwnerTabId != null) {
-    return state.joinRetryOwnerTabId === ownerTabId;
+
+  const recordingId = String(desktop.recordingId || "");
+  const authorization = String(desktop.captureAuthorization || "").trim().toLowerCase();
+  if (!recordingId || !/^[0-9a-f]{64}$/.test(authorization)) return;
+
+  const authorityChanged = (
+    !state.captureConsentArmed
+    || state.authorizedRecordingId !== recordingId
+    || state.captureAuthorization !== authorization
+  );
+  if (authorityChanged) {
+    if (state.captureConsentArmed) {
+      await clearCaptureAuthorization({
+        clearOutbox: state.recordingId !== recordingId,
+      });
+    }
+    await beginRecordingScope(recordingId);
+    state.captureAuthorizationEpoch += 1;
+    state.captureConsentArmed = true;
+    state.captureAuthorization = authorization;
+    state.authorizedRecordingId = recordingId;
+    state.recordingId = recordingId;
+    state.desktopFinalizeRequestId = "";
+    await writeCheckpoint();
+    publishCaptureAuthority();
   }
-  state.captureConsentArmed = true;
-  state.captureAuthorizationEpoch += 1;
-  state.captureConsentOwnerTabId = ownerTabId;
-  state.captureAuthorization = normalizedAuthorization;
-  state.captureDashboardOrigin = dashboardOrigin;
-  state.authorizedRecordingId = "";
-  state.joinRetryOwnerTabId = ownerTabId;
-  runJoinRetry(ownerTabId);
-  return true;
+
+  await ensureSegment("desktop_authority");
+
+  const finalizeRequest = desktop.finalizeRequest;
+  const requestId = String(finalizeRequest?.id || "");
+  if (
+    requestId
+    && requestId !== state.desktopFinalizeRequestId
+    && String(finalizeRequest?.recordingId || "") === recordingId
+  ) {
+    const result = await finalizeContinuity(recordingId);
+    await nativeRequest("desktop.finalize.ack", {
+      protocolVersion: PROTOCOL_VERSION,
+      recordingId,
+      requestId,
+      result,
+    });
+    state.desktopFinalizeRequestId = requestId;
+  }
 }
 
-async function cancelCaptureConsent(sender, captureAuthorization = "") {
-  const ownerTabId = sender?.tab?.id;
-  const normalizedAuthorization = String(captureAuthorization || "").trim().toLowerCase();
-  if (
-    !captureOwnedBySender(sender)
-    || (
-      state.authorizedRecordingId
-        ? normalizedAuthorization && normalizedAuthorization !== state.captureAuthorization
-        : (
-          state.captureConsentOwnerTabId !== ownerTabId
-          || state.joinRetryOwnerTabId !== ownerTabId
-          || normalizedAuthorization !== state.captureAuthorization
-        )
-    )
-  ) {
-    return false;
-  }
-  await clearCaptureAuthorization({ clearOutbox: true });
-  return true;
+async function syncDesktopCaptureAuthority() {
+  if (desktopAuthoritySyncPromise) return desktopAuthoritySyncPromise;
+  desktopAuthoritySyncPromise = (async () => {
+    const nativeStatus = await nativeOptional("status");
+    if (!nativeStatus) return;
+    await applyDesktopCaptureAuthority(nativeStatus);
+  })().finally(() => {
+    desktopAuthoritySyncPromise = null;
+  });
+  return desktopAuthoritySyncPromise;
 }
 
 function scheduleHeartbeat() {
@@ -813,8 +704,8 @@ async function finalizeContinuity(expectedRecordingId = "") {
     };
   }
   if (state.recordingId && state.recordingId !== expectedRecordingId) {
-    // The dashboard binds finalization to the immutable recording revision it
-    // is stopping. Force a host-authoritative rejoin after worker suspension;
+    // Desktop binds finalization to the immutable recording revision it is
+    // stopping. Force a host-authoritative rejoin after worker suspension;
     // never finalize whichever stale recording happened to be checkpointed.
     state.chromeSegmentActive = false;
     state.segmentId = "";
@@ -917,64 +808,10 @@ chrome.runtime.onConnect?.addListener((port) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
-    // Do not allow a fresh service worker's checkpoint restore to race a new
-    // user consent command and erase the authorization it just armed.
+    // Restore the worker before answering content-script authority queries.
     await startupPromise;
     if (msg?.type === "hcc-capture-authority-query") {
       sendResponse({ ok: true, ...captureAuthorityPayload(sender) });
-    } else if (msg?.type === "hcc-provider-command") {
-      if (!isTrustedDashboardSender(sender)) {
-        sendResponse({ ok: false, error: "Provider command rejected" });
-        return;
-      }
-      if (msg.command === "probe") {
-        sendResponse({ ok: true, contentScriptVersion: CONTENT_SCRIPT_VERSION });
-      } else if (msg.command === "prepare") {
-        let nativeStatus = null;
-        try {
-          nativeStatus = await nativeRequest("status", {}, 1500);
-        } catch (error) {
-          sendResponse({
-            ok: false,
-            contentScriptVersion: CONTENT_SCRIPT_VERSION,
-            error: `Hermes Chrome Provider cannot reach its native host: ${String(error?.message || error)}`,
-          });
-          return;
-        }
-        if (!nativeIdentityMatches(nativeStatus)) {
-          sendResponse({
-            ok: false,
-            contentScriptVersion: CONTENT_SCRIPT_VERSION,
-            error: "Hermes Chrome Provider and its native host are from different versions. Reinstall the current provider.",
-          });
-          return;
-        }
-        const prepared = armJoinRetry(
-          sender.tab.id,
-          msg.captureAuthorization,
-          dashboardOriginForSender(sender),
-        );
-        sendResponse(prepared
-          ? { ok: true, contentScriptVersion: CONTENT_SCRIPT_VERSION }
-          : { ok: false, error: "Provider join authorization was rejected or is owned by another Workflows tab" });
-      } else if (msg.command === "cancel") {
-        const cancelled = await cancelCaptureConsent(sender, msg.captureAuthorization);
-        sendResponse(cancelled
-          ? { ok: true, contentScriptVersion: CONTENT_SCRIPT_VERSION }
-          : { ok: false, error: "Provider join is not owned by this Workflows tab" });
-      } else if (msg.command === "finalize") {
-        if (!captureOwnedBySender(sender)) {
-          sendResponse({ ok: false, error: "Provider finalization was rejected" });
-          return;
-        }
-        const finalized = await finalizeContinuity(String(msg.recordingId || ""));
-        if (finalized.ok === true) {
-          await clearCaptureAuthorization({ clearOutbox: true });
-        }
-        sendResponse(finalized);
-      } else {
-        sendResponse({ ok: false, error: "Unknown provider command" });
-      }
     } else if (msg?.action === "status") {
       const native = await nativeOptional("status");
       sendResponse({
@@ -1052,23 +889,6 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!state.captureConsentArmed) return;
-  if (
-    state.captureConsentOwnerTabId === tabId
-    && !state.authorizedRecordingId
-    && (
-      changeInfo.status === "loading"
-      || (
-        changeInfo.url
-        && (
-          !isTrustedDashboardUrl(changeInfo.url)
-          || new URL(changeInfo.url).origin !== state.captureDashboardOrigin
-        )
-      )
-    )
-  ) {
-    void clearCaptureAuthorization({ clearOutbox: true });
-    return;
-  }
   if (!changeInfo.url && !changeInfo.title && changeInfo.status !== "complete") return;
   void (async () => {
     const beforeUrl = state.activeTarget?.url || "";
@@ -1087,14 +907,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   })().catch((error) => {
     console.warn("Hermes Chrome Provider did not persist top-level navigation", error);
   });
-});
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (state.captureConsentOwnerTabId === tabId) {
-    void clearCaptureAuthorization({
-      clearOutbox: !state.recordingId,
-      preserveRecordingScope: !!state.recordingId,
-    });
-  }
 });
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (!state.captureConsentArmed) return;
@@ -1140,12 +952,17 @@ chrome.downloads.onChanged.addListener(async (downloadDelta) => {
   }
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (state.captureConsentArmed && alarm.name === STATUS_ALARM) void ensureSegment("alarm");
+  if (alarm.name !== STATUS_ALARM) return;
+  void syncDesktopCaptureAuthority();
+  if (state.captureConsentArmed) void ensureSegment("alarm");
 });
 chrome.alarms.create(STATUS_ALARM, { delayInMinutes: STATUS_ALARM_MINUTES, periodInMinutes: STATUS_ALARM_MINUTES });
 chrome.runtime.onSuspend?.addListener(() => { void writeCheckpoint(); });
 
 startupPromise = (async () => {
   await restoreCheckpoint();
-  await restoreCaptureAuthorization();
+  await syncDesktopCaptureAuthority();
 })();
+desktopAuthorityTimer = setInterval(() => {
+  void syncDesktopCaptureAuthority();
+}, DESKTOP_AUTHORITY_POLL_MS);

@@ -1,9 +1,9 @@
 {
-  "name": "hermes-chrome-capture",
-  "version": "0.2.0",
+  "name": "record-chrome-capture",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Hermes Crunch adaptive Chrome provider extension.",
+  "description": "Record Chrome workflow capture extension.",
   "scripts": {
     "check": "node --check src/background.js && node --check src/causality.js && node --check src/popup.js && node --check src/user-events.js",
     "test": "node --test test/*.test.js"

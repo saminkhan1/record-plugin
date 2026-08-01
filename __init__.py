@@ -1,11 +1,9 @@
-"""Hermes Crunch standalone plugin."""
+"""Record standalone plugin."""
 
 
 def register(ctx):
-    """Register the private drafting surface and Cron authorization provider."""
+    """Bind Hermes-owned plugin services used by the Record backend."""
 
-    from hermes_crunch.authorization import register_authorization
-    from hermes_crunch.drafting_tools import register_drafting_tools
+    from .record.runtime import set_plugin_context
 
-    register_drafting_tools(ctx)
-    register_authorization(ctx)
+    set_plugin_context(ctx)

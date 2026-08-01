@@ -1,68 +1,57 @@
-"""Hermes Crunch dashboard plugin backend.
+"""Record Desktop backend routes.
 
-Mounted by Hermes under /api/plugins/hermes-crunch/.
+Mounted by Hermes under /api/plugins/record/.
 """
 
 from __future__ import annotations
 
-import ipaddress
+import hashlib
 import json
 import logging
 import os
-import sys
-import tempfile
+import secrets
 import threading
 import time
 import uuid
 import weakref
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
+from hermes_cli.plugins import discover_plugins
 
-from crunch_recorder import (  # noqa: E402
+discover_plugins()
+
+from hermes_plugins.record.record_recorder import (  # noqa: E402
     _recording_digest,
     compile_reviewed_recording,
-    crunch_install_readiness,
-    crunch_slug,
-    install_crunch_build,
-    load_crunch_modules,
+    record_slug,
+    load_record_modules,
     load_review_conversation,
-    prepare_install_authorization,
-    resolve_default_approval_target,
+    publish_record_build,
     review_conversation_path,
     save_review_conversation,
     workflow_digest,
 )
-from hermes_recorder import (  # noqa: E402
+from hermes_plugins.record.hermes_recorder import (  # noqa: E402
     active_native_recording,
-    delete_recording_bundle,
     discard_native_recording,
     recording_status as load_recording_status,
     start_native_recording,
-    stop_native_recording,
+    stop_desktop_recording,
 )
-from recording_bundle import (  # noqa: E402
-    enumerate_recording_bundles,
+from hermes_plugins.record.recording_bundle import (  # noqa: E402
     read_json,
-    recording_bundle_diagnostic,
-    recording_key as recording_bundle_key,
-    recordings_root,
     resolve_recording_ref,
     safe_recording_dir,
     write_json,
 )
-from hermes_crunch.trace_schema import utc_now  # noqa: E402
+from hermes_plugins.record.record.trace_schema import (  # noqa: E402
+    utc_now,
+)
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -73,6 +62,8 @@ _DRAFT_INACTIVITY_SECONDS = 10 * 60
 _DRAFT_MAX_RUNTIME_SECONDS = 30 * 60
 _DRAFT_TERMINAL_RETENTION_SECONDS = 10 * 60
 _DRAFT_MAX_OPERATIONS = 64
+_DESKTOP_CAPTURE_AUTHORIZATION_TTL_SECONDS = 2 * 60
+_DESKTOP_CAPTURE_AUTHORIZATION_LIMIT = 64
 
 
 @dataclass
@@ -82,7 +73,6 @@ class _DraftOperation:
     status: str = "drafting"
     result: Optional[Dict[str, Any]] = None
     error: str = ""
-    agent: Any = None
     cancel_requested: bool = False
     progress: List[Dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -101,17 +91,6 @@ class _DraftOperation:
             self.finished_monotonic = time.monotonic()
         self.terminal_event.set()
 
-    def attach_agent(self, agent: Any) -> None:
-        with self.lock:
-            should_interrupt = (
-                self.cancel_requested or self.status in _DRAFT_TERMINAL_STATUSES
-            )
-            if not should_interrupt:
-                self.agent = agent
-                self._touch_locked()
-        if should_interrupt:
-            agent.interrupt("Workflow drafting canceled by the operator")
-
     def cancel(self) -> None:
         with self.lock:
             if self.status in _DRAFT_TERMINAL_STATUSES:
@@ -122,12 +101,6 @@ class _DraftOperation:
             self._touch_locked()
             if self.status == "drafting":
                 self.status = "canceling"
-            agent = self.agent
-        if agent is not None:
-            self._interrupt_agent(
-                agent,
-                "Workflow drafting canceled by the operator",
-            )
 
     def begin_commit(self) -> bool:
         """Claim the irreversible publication boundary for this draft."""
@@ -156,7 +129,6 @@ class _DraftOperation:
             self.result = result
             self.error = ""
             self.status = "completed"
-            self.agent = None
             self._finish_locked()
             return True
 
@@ -175,7 +147,6 @@ class _DraftOperation:
             else:
                 self.error = detail or "Workflow drafting stopped unexpectedly."
                 self.status = "failed"
-            self.agent = None
             self._finish_locked()
             return True
 
@@ -183,17 +154,6 @@ class _DraftOperation:
         """Close any worker path that unwound without declaring an outcome."""
 
         self.fail("Workflow drafting stopped before it produced a result. Please retry.")
-
-    def detach_agent(self) -> None:
-        with self.lock:
-            self.agent = None
-
-    @staticmethod
-    def _interrupt_agent(agent: Any, reason: str) -> None:
-        try:
-            agent.interrupt(reason)
-        except Exception:
-            log.debug("Could not interrupt Crunch drafter", exc_info=True)
 
     def on_progress(
         self,
@@ -216,16 +176,6 @@ class _DraftOperation:
             entry["is_error"] = bool(details["is_error"])
         with self.lock:
             self.progress.append(entry)
-            self.progress = self.progress[-50:]
-            self._touch_locked()
-
-    def on_interim(self, text: str, **_details: Any) -> None:
-        """Forward real mid-turn assistant commentary already emitted by Hermes."""
-        visible = str(text or "").strip()
-        if not visible:
-            return
-        with self.lock:
-            self.progress.append({"type": "assistant.message", "text": visible})
             self.progress = self.progress[-50:]
             self._touch_locked()
 
@@ -262,14 +212,8 @@ class _DraftOperation:
             )
             if not worker_stopped and not timed_out:
                 return False
-            agent = self.agent
             canceled = self.cancel_requested
 
-        if agent is not None:
-            self._interrupt_agent(
-                agent,
-                "Workflow drafting timed out before it produced a result",
-            )
         detail = (
             "Workflow drafting stopped before it produced a result. Please retry."
             if worker_stopped
@@ -278,7 +222,7 @@ class _DraftOperation:
         accepted = self.fail(detail)
         if accepted:
             log.warning(
-                "Crunch draft operation %s %s",
+                "Record draft operation %s %s",
                 self.operation_id,
                 "canceled after timeout" if canceled else "failed watchdog reconciliation",
             )
@@ -291,6 +235,8 @@ _RECORDING_OPERATION_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = 
     weakref.WeakValueDictionary()
 )
 _RECORDING_OPERATION_LOCKS_GUARD = threading.Lock()
+_DESKTOP_CAPTURE_AUTHORIZATIONS: Dict[str, Dict[str, Any]] = {}
+_DESKTOP_CAPTURE_AUTHORIZATIONS_LOCK = threading.Lock()
 
 
 def _recording_operation_lock(recording_dir: Path) -> threading.RLock:
@@ -406,111 +352,67 @@ def _register_draft_operation(operation: _DraftOperation) -> None:
 
 
 def _watch_draft_operation(operation: _DraftOperation) -> None:
-    """Monitor one worker independently of dashboard polling."""
+    """Monitor one worker independently of Desktop polling."""
 
     while not operation.terminal_event.wait(timeout=30):
         if operation.reconcile():
             return
 
 
-class CrunchRecordingStartRequest(BaseModel):
-    profile: str = "default"
+class RecordDesktopCaptureAuthorizationRequest(BaseModel):
+    profile: str = ""
     name: str = Field(min_length=1)
     instructions: str = Field(min_length=1)
     schedule: str = ""
     run_mode: str = "schedule"
+
+
+class RecordDesktopRecordingStartRequest(
+    RecordDesktopCaptureAuthorizationRequest
+):
     capture_authorization_nonce: str = Field(
         min_length=64,
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
-    capture_dashboard_origin: str = Field(min_length=1, max_length=256)
+    capture_authorization: Optional[Dict[str, Any]] = None
 
 
-def _capture_request_dashboard_origin(request: Request) -> str:
-    """Bind a capture start to this loopback server's actual browser origin."""
-
-    parsed = None
-    try:
-        parsed = urlsplit(str(request.url))
-        hostname = str(parsed.hostname or "").lower()
-        port = parsed.port
-        server = request.scope.get("server")
-        bound_port = (
-            int(server[1])
-            if isinstance(server, (list, tuple)) and len(server) >= 2
-            else None
-        )
-        client_host = str(request.client.host if request.client else "")
-        client_is_loopback = ipaddress.ip_address(client_host).is_loopback
-    except (IndexError, TypeError, ValueError):
-        hostname = ""
-        port = None
-        bound_port = None
-        client_is_loopback = False
-    if (
-        parsed is None
-        or parsed.scheme != "http"
-        or hostname not in {"127.0.0.1", "localhost", "::1"}
-        or port is None
-        or bound_port is None
-        or port != bound_port
-        or not client_is_loopback
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Recording must be started from the local Hermes Workflows page.",
-        )
-    canonical_host = f"[{hostname}]" if ":" in hostname else hostname
-    server_origin = f"http://{canonical_host}:{port}"
-    request_origin = str(request.headers.get("origin") or "").strip()
-    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
-    if request_origin != server_origin or fetch_site not in {"", "same-origin"}:
-        raise HTTPException(
-            status_code=403,
-            detail="Recording must be started from the active Hermes Workflows page.",
-        )
-    return server_origin
+class RecordRecordingDiscardRequest(BaseModel):
+    profile: str = ""
 
 
-class CrunchRecordingDiscardRequest(BaseModel):
-    profile: str = "default"
-
-
-class CrunchRecordingStopRequest(CrunchRecordingDiscardRequest):
-    chrome_finalize_ok: Optional[bool] = None
-    chrome_finalize_error: str = Field(default="", max_length=500)
-
-
-class CrunchRecordingDraftOnlyRequest(BaseModel):
-    profile: str = "default"
+class RecordRecordingDraftOnlyRequest(BaseModel):
+    profile: str = ""
     name: str = Field(min_length=1)
     instructions: str = Field(min_length=1)
+    schedule: str = ""
     expected_draft_digest: Optional[str] = None
     review_thread_id: Optional[str] = None
 
 
-class CrunchReviewConversationRequest(BaseModel):
-    profile: str = "default"
+class RecordReviewConversationRequest(BaseModel):
+    profile: str = ""
     expected_draft_digest: str = Field(min_length=1)
     message: Optional[str] = Field(default=None, max_length=4000)
 
 
-class CrunchScheduleRecordingRequest(BaseModel):
-    profile: str = "default"
+class RecordScheduleRecordingRequest(BaseModel):
+    profile: str = ""
     recording_dir: str
     schedule: str = ""
     run_mode: str = "schedule"
     expected_draft_digest: str = Field(min_length=1)
-    authorization: Optional[Dict[str, Any]] = None
-    approve: bool = False
-    expected_approval_envelope_sha256: Optional[str] = None
+    publish: bool = False
+    expected_review_envelope_sha256: Optional[str] = None
 
 
-def _default_approval_target(*, home: Path) -> tuple[str, dict]:
-    """Compatibility wrapper around the canonical Crunch install resolver."""
-
-    return resolve_default_approval_target(home=home)
+class RecordSetJobRequest(BaseModel):
+    profile: str = ""
+    recording_dir: str
+    schedule: str = ""
+    run_mode: str = "schedule"
+    expected_draft_digest: str = Field(min_length=1)
 
 
 def _review_thread_for_digest(conversation: dict[str, Any], draft_digest: str) -> dict[str, Any] | None:
@@ -547,6 +449,36 @@ def _public_review_thread(thread: dict[str, Any]) -> dict[str, Any]:
         "state": thread.get("state"),
         "messages": messages,
         "feedback_summary": str(thread.get("feedback_summary") or ""),
+    }
+
+
+def _script_review(workflow: dict[str, Any]) -> dict[str, str] | None:
+    execution = (
+        workflow.get("execution")
+        if isinstance(workflow.get("execution"), dict)
+        else {}
+    )
+    script = (
+        execution.get("script")
+        if isinstance(execution.get("script"), dict)
+        else None
+    )
+    if script is None:
+        return None
+    path = script.get("path")
+    source = script.get("body")
+    if (
+        not isinstance(path, str)
+        or not path.strip()
+        or not isinstance(source, str)
+        or not source.strip()
+    ):
+        return None
+    source = source if source.endswith("\n") else source + "\n"
+    return {
+        "path": path.strip(),
+        "source": source,
+        "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
     }
 
 
@@ -604,8 +536,6 @@ def _review_conversation_response(
     draft_digest: str,
     conversation: dict[str, Any],
     compiler: Any,
-    home: Path | None = None,
-    include_install_readiness: bool = True,
 ) -> dict[str, Any]:
     state, blockers, thread = _derived_review_state(
         workflow=workflow,
@@ -619,7 +549,7 @@ def _review_conversation_response(
             thread is None and state == "needs_input"
         ),
         "blockers": blockers,
-        "effective_approval_boundaries": compiler.effective_approval_boundaries(workflow),
+        "script_review": _script_review(workflow),
         "thread_id": thread.get("thread_id") if thread else None,
         "threads": [
             _public_review_thread(item)
@@ -632,22 +562,6 @@ def _review_conversation_response(
             and _thread_matches_current_blockers(item, blockers)
         ],
     }
-    if home is not None and include_install_readiness:
-        execution = (
-            workflow.get("execution")
-            if isinstance(workflow.get("execution"), dict)
-            else {}
-        )
-        install_readiness = crunch_install_readiness(
-            home=home,
-            authorization=execution.get("authorization"),
-            run_mode=str(workflow.get("run_mode") or "schedule"),
-        )
-        response["install_readiness"] = install_readiness
-        response["approval_route_ready"] = install_readiness[
-            "approval_route_ready"
-        ]
-        response["webhook_runtime"] = install_readiness["webhook_runtime"]
     return response
 
 
@@ -675,16 +589,10 @@ def _revision_context(
         "prior_revision": draft_revision,
         "prior_plan": {
             "review_outline": list(review.get("execution_steps") or []),
-            "approval_steps": [
-                dict(item)
-                for item in review.get("approval_steps") or []
-                if isinstance(item, dict)
-            ],
             "trigger": workflow.get("trigger") if isinstance(workflow.get("trigger"), dict) else {},
             "execution": {
                 "prompt": execution.get("prompt"),
                 "requirements": execution.get("requirements"),
-                "authorization": execution.get("authorization"),
                 "script_path": script.get("path"),
             },
         },
@@ -766,7 +674,6 @@ def _review_seed(
         "workflow_name": str(workflow.get("name") or "")[:256],
         "workflow_instructions": str(workflow.get("instructions") or "")[:1200],
         "steps": review.get("execution_steps") if isinstance(review.get("execution_steps"), list) else [],
-        "effective_approval_boundaries": compiler.effective_approval_boundaries(workflow),
         "blockers": compiler.review_blockers(workflow),
         "trigger": workflow.get("trigger") if isinstance(workflow.get("trigger"), dict) else {},
         "required_apps": requirements.get("apps") if isinstance(requirements.get("apps"), list) else [],
@@ -780,49 +687,29 @@ def _review_seed(
 
 
 def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
-    from hermes_cli import profiles as profiles_mod
+    from hermes_plugins.record.record.runtime import plugin_profile
 
-    raw = (profile or "default").strip() or "default"
-    try:
-        canon = profiles_mod.normalize_profile_name(raw)
-        profiles_mod.validate_profile_name(canon)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not profiles_mod.profile_exists(canon):
-        raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
-    return canon, profiles_mod.get_profile_dir(canon)
-
-
-def _resume_recording_payload(home: Path, profile_name: str) -> Optional[Dict[str, Any]]:
-    bundle_diagnostics = enumerate_recording_bundles(home)
-    diagnostics_by_key = {
-        str(item.get("recording_key") or ""): item
-        for item in bundle_diagnostics
-        if isinstance(item, dict)
-    }
-
-    def mark_recovery_error(recording_dir: Path, error: str) -> None:
-        diagnostic = diagnostics_by_key.get(
-            recording_bundle_key(home, recording_dir)
+    active_name, active_home = plugin_profile()
+    raw = str(profile or "").strip()
+    if raw and raw.lower() != active_name:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Hermes changed profiles. Reopen Workflows from the "
+                f"active Hermes backend ({active_name})."
+            ),
         )
-        if diagnostic is None:
-            return
-        diagnostic["healthy"] = False
-        errors = diagnostic.get("errors")
-        if not isinstance(errors, list):
-            errors = []
-            diagnostic["errors"] = errors
-        if error not in errors:
-            errors.append(error)
+    return active_name, active_home
 
+
+def _active_recording_payload(home: Path, profile_name: str) -> Dict[str, Any]:
     active = active_native_recording(home=home, profile_name=profile_name)
     if isinstance(active, dict) and active.get("recording_dir"):
         try:
             recording_dir = safe_recording_dir(home, str(active["recording_dir"]))
             metadata = read_json(recording_dir / "metadata.json")
         except HTTPException:
-            # A stale/corrupt active pointer is one bundle diagnostic, not an
-            # endpoint-wide failure. Continue to the healthy stopped captures.
+            # A corrupt live session cannot be resumed safely.
             pass
         else:
             return {
@@ -830,132 +717,14 @@ def _resume_recording_payload(home: Path, profile_name: str) -> Optional[Dict[st
                     **active,
                     "instructions": metadata.get("instructions") or active.get("instructions") or "",
                     "schedule": metadata.get("schedule") or "",
-                    "run_mode": "webhook" if metadata.get("trigger_requested") is True else "schedule",
+                    "run_mode": (
+                        "webhook"
+                        if metadata.get("trigger_requested") is True
+                        else "schedule"
+                    ),
                 },
-                "draft": None,
-                "bundle_diagnostics": bundle_diagnostics,
             }
-
-    candidates = []
-    for recording_dir in recordings_root(home).glob("*/*"):
-        metadata_path = recording_dir / "metadata.json"
-        session_path = recording_dir / "session.json"
-        if not metadata_path.is_file() or not session_path.is_file():
-            continue
-        try:
-            metadata = read_json(metadata_path)
-            session = read_json(session_path)
-        except HTTPException:
-            continue
-        if metadata.get("source") != "dashboard":
-            continue
-        if metadata.get("profile") not in (None, "", profile_name):
-            continue
-        state = str(metadata.get("state") or session.get("status") or "stopped")
-        if state in {"scheduled", "dismissed"}:
-            continue
-        diagnostic = diagnostics_by_key.get(
-            recording_bundle_key(home, recording_dir)
-        )
-        if diagnostic is not None and not diagnostic.get("healthy"):
-            continue
-        try:
-            modified_at = recording_dir.stat().st_mtime
-        except OSError:
-            modified_at = 0.0
-        candidates.append((modified_at, recording_dir, metadata, state))
-    if not candidates:
-        return {
-            "recording": None,
-            "draft": None,
-            "bundle_diagnostics": bundle_diagnostics,
-        }
-
-    modules = None
-    for _, recording_dir, metadata, state in sorted(
-        candidates,
-        key=lambda item: item[0],
-        reverse=True,
-    ):
-        recording = {
-            "recording_dir": str(recording_dir),
-            "recording_key": recording_bundle_key(home, recording_dir),
-            "name": (
-                metadata.get("name")
-                or metadata.get("workflow_id")
-                or recording_dir.parent.name
-            ),
-            "instructions": metadata.get("instructions") or "",
-            "schedule": metadata.get("schedule") or "",
-            "run_mode": (
-                "webhook"
-                if metadata.get("trigger_requested") is True
-                else "schedule"
-            ),
-            "status": state,
-        }
-        workflow_path = recording_dir / "workflow.json"
-        if not workflow_path.is_file():
-            return {
-                "recording": recording,
-                "draft": None,
-                "bundle_diagnostics": bundle_diagnostics,
-            }
-
-        try:
-            workflow = read_json(workflow_path)
-        except HTTPException as exc:
-            mark_recovery_error(
-                recording_dir,
-                f"invalid:workflow.json:{type(exc).__name__}",
-            )
-            continue
-        if modules is None:
-            modules = load_crunch_modules()
-        draft_digest = workflow_digest(workflow)
-        try:
-            conversation = load_review_conversation(recording_dir)
-        except (OSError, UnicodeError, ValueError) as exc:
-            mark_recovery_error(
-                recording_dir,
-                f"invalid:review-conversation.json:{type(exc).__name__}",
-            )
-            continue
-        try:
-            review_state = _review_conversation_response(
-                workflow=workflow,
-                draft_digest=draft_digest,
-                conversation=conversation,
-                compiler=modules["compiler"],
-                home=home,
-                include_install_readiness=False,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            mark_recovery_error(
-                recording_dir,
-                f"invalid:workflow-review:{type(exc).__name__}",
-            )
-            continue
-        draft = {
-            "recording_dir": str(recording_dir),
-            "workflow": workflow,
-            "draft_digest": draft_digest,
-            "effective_approval_boundaries": review_state[
-                "effective_approval_boundaries"
-            ],
-            "review_blockers": review_state["blockers"],
-        }
-        return {
-            "recording": recording,
-            "draft": draft,
-            "bundle_diagnostics": bundle_diagnostics,
-        }
-
-    return {
-        "recording": None,
-        "draft": None,
-        "bundle_diagnostics": bundle_diagnostics,
-    }
+    return {"recording": None}
 
 
 def _mark_recording_scheduled(
@@ -973,54 +742,188 @@ def _mark_recording_scheduled(
         write_json(path, value)
 
 
-@router.get("/recordings/resume")
-def resume_recording(profile: str = "default"):
+@router.get("/recordings/active")
+def active_recording(profile: str = ""):
     profile_name, home = _cron_profile_home(profile)
-    return _resume_recording_payload(home, profile_name)
+    return _active_recording_payload(home, profile_name)
 
 
-@router.post("/recordings/start")
-def start_recording(body: CrunchRecordingStartRequest, request: Request):
-    request_dashboard_origin = _capture_request_dashboard_origin(request)
-    if body.capture_dashboard_origin != request_dashboard_origin:
+@router.get("/webhook-status")
+def get_webhook_status(profile: str = ""):
+    _profile_name, home = _cron_profile_home(profile)
+    modules = load_record_modules()
+    try:
+        return modules["hermes"].webhook_runtime_status(hermes_home=home)
+    except Exception as exc:
+        log.warning("Could not read Hermes webhook receiver status: %s", exc)
+        return {
+            "enabled": False,
+            "configured": False,
+            "ready": False,
+            "reason": str(exc),
+        }
+
+
+def _start_mode(run_mode: str, schedule: str) -> tuple[str, str]:
+    mode = str(run_mode or "schedule").strip().lower()
+    if mode not in {"schedule", "webhook"}:
         raise HTTPException(
-            status_code=403,
-            detail="Chrome capture authorization does not match this Hermes dashboard.",
+            status_code=400,
+            detail="run_mode must be schedule or webhook",
         )
+    normalized_schedule = str(schedule or "").strip()
+    if mode == "schedule" and not normalized_schedule:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a schedule or an event trigger before recording.",
+        )
+    return mode, "triggered" if mode == "webhook" else normalized_schedule
+
+
+def _desktop_capture_authorization_claim(
+    *,
+    profile: str,
+    name: str,
+    instructions: str,
+    schedule: str,
+    run_mode: str,
+) -> Dict[str, Any]:
+    return {
+        "profile": profile,
+        "name": name.strip(),
+        "instructions": instructions.strip(),
+        "schedule": schedule,
+        "run_mode": run_mode,
+    }
+
+
+def _issue_desktop_capture_authorization(claim: Dict[str, Any]) -> str:
+    nonce = secrets.token_hex(32)
+    now = time.monotonic()
+    with _DESKTOP_CAPTURE_AUTHORIZATIONS_LOCK:
+        expired = [
+            token
+            for token, authorization in _DESKTOP_CAPTURE_AUTHORIZATIONS.items()
+            if now - float(authorization.get("issued_monotonic") or 0)
+            > _DESKTOP_CAPTURE_AUTHORIZATION_TTL_SECONDS
+        ]
+        for token in expired:
+            _DESKTOP_CAPTURE_AUTHORIZATIONS.pop(token, None)
+        if len(_DESKTOP_CAPTURE_AUTHORIZATIONS) >= _DESKTOP_CAPTURE_AUTHORIZATION_LIMIT:
+            oldest = min(
+                _DESKTOP_CAPTURE_AUTHORIZATIONS,
+                key=lambda token: float(
+                    _DESKTOP_CAPTURE_AUTHORIZATIONS[token].get("issued_monotonic")
+                    or 0
+                ),
+            )
+            _DESKTOP_CAPTURE_AUTHORIZATIONS.pop(oldest, None)
+        _DESKTOP_CAPTURE_AUTHORIZATIONS[nonce] = {
+            "issued_monotonic": now,
+            "claim": dict(claim),
+        }
+    return nonce
+
+
+def _consume_desktop_capture_authorization(
+    nonce: str,
+    claim: Dict[str, Any],
+) -> None:
+    now = time.monotonic()
+    with _DESKTOP_CAPTURE_AUTHORIZATIONS_LOCK:
+        authorization = _DESKTOP_CAPTURE_AUTHORIZATIONS.pop(nonce, None)
+    if (
+        not authorization
+        or now - float(authorization.get("issued_monotonic") or 0)
+        > _DESKTOP_CAPTURE_AUTHORIZATION_TTL_SECONDS
+        or authorization.get("claim") != claim
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Desktop Chrome capture authorization expired, was already "
+                "used, or does not match this recording."
+            ),
+        )
+
+
+@router.post("/recordings/capture-authorization")
+def provision_desktop_capture_authorization(
+    body: RecordDesktopCaptureAuthorizationRequest,
+):
+    run_mode, schedule = _start_mode(body.run_mode, body.schedule)
+    profile_name, _home = _cron_profile_home(body.profile)
+    claim = _desktop_capture_authorization_claim(
+        profile=profile_name,
+        name=body.name,
+        instructions=body.instructions,
+        schedule=schedule,
+        run_mode=run_mode,
+    )
+    nonce = _issue_desktop_capture_authorization(claim)
+    return {
+        "source": "desktop",
+        "profile": profile_name,
+        "capture_authorization_nonce": nonce,
+    }
+
+
+@router.post("/recordings/start-desktop")
+def start_desktop_recording(body: RecordDesktopRecordingStartRequest):
+    run_mode, schedule = _start_mode(body.run_mode, body.schedule)
     profile_name, home = _cron_profile_home(body.profile)
-    workflow_id = crunch_slug(body.name, "workflow")
-    run_mode = body.run_mode.strip().lower()
-    if run_mode not in {"schedule", "webhook"}:
-        raise HTTPException(status_code=400, detail="run_mode must be schedule or webhook")
-    if run_mode == "schedule" and not body.schedule.strip():
-        raise HTTPException(status_code=400, detail="Choose a schedule or an event trigger before recording.")
+    authorization = (
+        body.capture_authorization
+        if isinstance(body.capture_authorization, dict)
+        else {}
+    )
+    if (
+        authorization.get("source") != "desktop"
+        or authorization.get("profile") != profile_name
+        or authorization.get("capture_authorization_nonce")
+        != body.capture_authorization_nonce
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Desktop Chrome capture authorization does not match.",
+        )
+    _consume_desktop_capture_authorization(
+        body.capture_authorization_nonce,
+        _desktop_capture_authorization_claim(
+            profile=profile_name,
+            name=body.name,
+            instructions=body.instructions,
+            schedule=schedule,
+            run_mode=run_mode,
+        ),
+    )
     return start_native_recording(
         home=home,
         profile_name=profile_name,
-        workflow_id=workflow_id,
+        workflow_id=record_slug(body.name, "workflow"),
         name=body.name.strip(),
         instructions=body.instructions.strip(),
-        schedule=body.schedule.strip() if run_mode == "schedule" else "triggered",
+        schedule=schedule,
         capture_authorization_nonce=body.capture_authorization_nonce,
-        capture_dashboard_origin=request_dashboard_origin,
         trigger_requested=run_mode == "webhook",
     )
 
 
-@router.post("/recordings/{recording_key:path}/stop")
-def stop_recording(recording_key: str, body: CrunchRecordingStopRequest):
+@router.post("/recordings/{recording_key:path}/stop-desktop")
+def stop_recording_from_desktop(
+    recording_key: str,
+    body: RecordRecordingDiscardRequest,
+):
     _profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key)
-    return stop_native_recording(
+    return stop_desktop_recording(
         home=home,
         recording_dir=recording_dir,
-        chrome_finalize_ok=body.chrome_finalize_ok,
-        chrome_finalize_error=body.chrome_finalize_error,
     )
 
 
 @router.post("/recordings/{recording_key:path}/discard")
-def discard_recording(recording_key: str, body: CrunchRecordingDiscardRequest):
+def discard_recording(recording_key: str, body: RecordRecordingDiscardRequest):
     _profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key, require_bundle=False)
     # Do not delete or mutate a bundle while its drafter is reading/staging it.
@@ -1048,128 +951,13 @@ def discard_recording(recording_key: str, body: CrunchRecordingDiscardRequest):
         return discard_native_recording(home=home, recording_dir=recording_dir)
 
 
-@router.post("/recordings/{recording_key:path}/permanent-delete")
-def permanently_delete_recording(
-    recording_key: str,
-    body: CrunchRecordingDiscardRequest,
-):
-    """Delete one exact recovery bundle after capture shutdown is proven."""
-
-    _profile_name, home = _cron_profile_home(body.profile)
-    recording_dir = resolve_recording_ref(home, recording_key, require_bundle=False)
-    diagnostic = recording_bundle_diagnostic(home, recording_dir)
-    if diagnostic.get("state") == "scheduled":
-        raise HTTPException(
-            status_code=409,
-            detail="An installed workflow's recording evidence cannot be permanently deleted.",
-        )
-    if diagnostic.get("healthy"):
-        raise HTTPException(
-            status_code=409,
-            detail="Healthy recordings are retained through dismissal and cannot be permanently deleted here.",
-        )
-    if _cancel_active_draft_operations(recording_dir):
-        raise HTTPException(
-            status_code=409,
-            detail="Drafting is being canceled. Wait, then delete the damaged recording.",
-        )
-    with _recording_operation_lock(recording_dir):
-        if _draft_operation_active(recording_dir):
-            raise HTTPException(
-                status_code=409,
-                detail="Drafting is still finishing cancellation.",
-            )
-        # Recheck under the per-recording lock so a bundle repaired while this
-        # request waited cannot cross the destructive boundary as "damaged."
-        current_diagnostic = recording_bundle_diagnostic(home, recording_dir)
-        if current_diagnostic.get("state") == "scheduled":
-            raise HTTPException(
-                status_code=409,
-                detail="An installed workflow's recording evidence cannot be permanently deleted.",
-            )
-        if current_diagnostic.get("healthy"):
-            raise HTTPException(
-                status_code=409,
-                detail="The recording recovered and is no longer eligible for permanent deletion.",
-            )
-        return delete_recording_bundle(home=home, recording_dir=recording_dir)
-
-
-@router.post("/recordings/{recording_key:path}/restore")
-def restore_recording(recording_key: str, body: CrunchRecordingDiscardRequest):
-    """Return one retained dismissed bundle to the normal review flow."""
-
-    _profile_name, home = _cron_profile_home(body.profile)
-    recording_dir = resolve_recording_ref(home, recording_key)
-    with _recording_operation_lock(recording_dir):
-        if _draft_operation_active(recording_dir):
-            raise HTTPException(
-                status_code=409,
-                detail="Wait for drafting to finish before restoring this recording.",
-            )
-        status = load_recording_status(home=home, recording_dir=recording_dir)["status"]
-        if status != "dismissed":
-            raise HTTPException(
-                status_code=409,
-                detail="Only a retained dismissed recording can be restored.",
-            )
-        restored_state = (
-            "drafted" if (recording_dir / "workflow.json").is_file() else "stopped"
-        )
-        for path in (recording_dir / "metadata.json", recording_dir / "session.json"):
-            value = read_json(path)
-            value["state"] = restored_state
-            value["status"] = restored_state
-            value.pop("dismissed_at", None)
-            write_json(path, value)
-        return {"status": restored_state}
-
-
-@router.get("/recordings/{recording_key:path}/export")
-def export_recording_bundle(recording_key: str, profile: str = "default"):
-    """Export recovery evidence without buffering a potentially large video."""
-
-    _profile_name, home = _cron_profile_home(profile)
-    recording_dir = resolve_recording_ref(home, recording_key, require_bundle=False)
-    fd, archive_name = tempfile.mkstemp(
-        prefix=f"hermes-crunch-{recording_dir.name}-",
-        suffix=".zip",
-    )
-    os.close(fd)
-    archive_path = Path(archive_name)
-    try:
-        with zipfile.ZipFile(
-            archive_path,
-            "w",
-            compression=zipfile.ZIP_DEFLATED,
-        ) as output:
-            for path in sorted(recording_dir.rglob("*")):
-                if not path.is_file() or path.is_symlink():
-                    continue
-                resolved = path.resolve()
-                try:
-                    relative = resolved.relative_to(recording_dir)
-                except ValueError:
-                    continue
-                output.write(resolved, relative.as_posix())
-    except Exception:
-        archive_path.unlink(missing_ok=True)
-        raise
-    return FileResponse(
-        archive_path,
-        media_type="application/zip",
-        filename=f"{recording_dir.name}.zip",
-        background=BackgroundTask(archive_path.unlink, missing_ok=True),
-    )
-
-
 @router.get("/recordings/{recording_key:path}/review-conversation")
 def get_review_conversation(
     recording_key: str,
-    profile: str = "default",
+    profile: str = "",
     expected_draft_digest: str = "",
 ):
-    modules = load_crunch_modules()
+    modules = load_record_modules()
     profile_name, home = _cron_profile_home(profile)
     recording_dir = resolve_recording_ref(home, recording_key)
     with _recording_operation_lock(recording_dir):
@@ -1185,13 +973,12 @@ def get_review_conversation(
             draft_digest=draft_digest,
             conversation=load_review_conversation(recording_dir),
             compiler=modules["compiler"],
-            home=home,
         )
 
 
 @router.post("/recordings/{recording_key:path}/review-conversation")
-def post_review_conversation(recording_key: str, body: CrunchReviewConversationRequest):
-    modules = load_crunch_modules()
+def post_review_conversation(recording_key: str, body: RecordReviewConversationRequest):
+    modules = load_record_modules()
     profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key)
     with _recording_operation_lock(recording_dir):
@@ -1297,14 +1084,13 @@ def post_review_conversation(recording_key: str, body: CrunchReviewConversationR
             draft_digest=draft_digest,
             conversation=conversation,
             compiler=modules["compiler"],
-            home=home,
         )
 
 
 @router.post("/recordings/{recording_key:path}/draft")
-def draft_recording_only(recording_key: str, body: CrunchRecordingDraftOnlyRequest):
-    modules = load_crunch_modules()
-    _profile_name, home = _cron_profile_home(body.profile)
+def draft_recording_only(recording_key: str, body: RecordRecordingDraftOnlyRequest):
+    modules = load_record_modules()
+    profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key)
     current = load_recording_status(home=home, recording_dir=recording_dir)
     if current.get("status") == "recording":
@@ -1386,9 +1172,7 @@ def draft_recording_only(recording_key: str, body: CrunchRecordingDraftOnlyReque
                     context,
                     recording_dir=recording_dir,
                     home=home,
-                    on_agent=operation.attach_agent,
                     on_progress=operation.on_progress,
-                    on_interim=operation.on_interim,
                     revision_context=revision_context,
                 )
 
@@ -1399,6 +1183,9 @@ def draft_recording_only(recording_key: str, body: CrunchRecordingDraftOnlyReque
                 instructions=body.instructions.strip(),
                 workflow_author=author,
             )
+            candidate.metadata["profile"] = profile_name
+            if body.schedule.strip():
+                candidate.metadata["schedule"] = body.schedule.strip()
             candidate_review = candidate.workflow.get("review") if isinstance(candidate.workflow.get("review"), dict) else {}
             candidate_review["draft_revision"] = previous_revision + 1
             if source_digest:
@@ -1443,31 +1230,29 @@ def draft_recording_only(recording_key: str, body: CrunchRecordingDraftOnlyReque
                 "recording_dir": str(recording_dir),
                 "workflow": candidate.workflow,
                 "draft_digest": next_digest,
-                "effective_approval_boundaries": modules["compiler"].effective_approval_boundaries(candidate.workflow),
                 "review_blockers": modules["compiler"].review_blockers(candidate.workflow),
             }
             operation.complete(draft)
         except BaseException as exc:
             accepted = operation.fail(exc)
             if accepted and not operation.cancel_requested:
-                log.exception("Crunch recording draft failed")
+                log.exception("Record recording draft failed")
         finally:
             for _target, temporary in staged:
                 temporary.unlink(missing_ok=True)
-            operation.detach_agent()
             operation.ensure_terminal()
 
     worker = threading.Thread(
         target=run_draft,
         daemon=True,
-        name=f"hermes-crunch-draft-{operation.operation_id[:8]}",
+        name=f"record-draft-{operation.operation_id[:8]}",
     )
     operation.attach_worker(worker)
     try:
         worker.start()
     except BaseException as exc:
         operation.fail(exc)
-        log.exception("Could not start Crunch drafting worker")
+        log.exception("Could not start Record drafting worker")
     else:
         operation.mark_worker_started()
         try:
@@ -1475,12 +1260,12 @@ def draft_recording_only(recording_key: str, body: CrunchRecordingDraftOnlyReque
                 target=_watch_draft_operation,
                 args=(operation,),
                 daemon=True,
-                name=f"hermes-crunch-watch-{operation.operation_id[:8]}",
+                name=f"record-watch-{operation.operation_id[:8]}",
             ).start()
         except BaseException:
             # Status polling also reconciles this operation; failure to create
             # the convenience watcher must not invalidate a live worker.
-            log.exception("Could not start Crunch drafting watchdog")
+            log.exception("Could not start Record drafting watchdog")
     return _draft_operation_payload(operation)
 
 
@@ -1497,8 +1282,8 @@ def cancel_draft_operation(operation_id: str):
 
 
 @router.post("/recordings/schedule")
-def schedule_recording(body: CrunchScheduleRecordingRequest):
-    modules = load_crunch_modules()
+def schedule_recording(body: RecordScheduleRecordingRequest):
+    modules = load_record_modules()
     profile_name, home = _cron_profile_home(body.profile)
     recording_dir = safe_recording_dir(home, body.recording_dir)
     with _recording_operation_lock(recording_dir):
@@ -1511,16 +1296,43 @@ def schedule_recording(body: CrunchScheduleRecordingRequest):
         )
 
 
+@router.post("/recordings/set-job")
+def set_recording_as_hermes_job(body: RecordSetJobRequest):
+    run_mode, schedule = _start_mode(body.run_mode, body.schedule)
+    modules = load_record_modules()
+    profile_name, home = _cron_profile_home(body.profile)
+    recording_dir = safe_recording_dir(home, body.recording_dir)
+    request = RecordScheduleRecordingRequest(
+        profile=profile_name,
+        recording_dir=str(recording_dir),
+        schedule=schedule if run_mode == "schedule" else "",
+        run_mode=run_mode,
+        expected_draft_digest=body.expected_draft_digest,
+        publish=True,
+    )
+    with _recording_operation_lock(recording_dir):
+        return _schedule_recording_locked(
+            request,
+            modules=modules,
+            profile_name=profile_name,
+            home=home,
+            recording_dir=recording_dir,
+            publish_current_build=True,
+        )
+
+
 def _schedule_recording_locked(
-    body: CrunchScheduleRecordingRequest,
+    body: RecordScheduleRecordingRequest,
     *,
     modules: Dict[str, Any],
     profile_name: str,
     home: Path,
     recording_dir: Path,
+    publish_current_build: bool = False,
 ):
     if _draft_operation_active(recording_dir):
         raise HTTPException(status_code=409, detail="A draft operation is already in progress.")
+    run_mode, schedule = _start_mode(body.run_mode, body.schedule)
 
     workflow_path = recording_dir / "workflow.json"
     if not workflow_path.is_file():
@@ -1530,7 +1342,7 @@ def _schedule_recording_locked(
         raise HTTPException(status_code=409, detail="The reviewed draft changed. Reload the workflow review.")
     blockers = modules["compiler"].review_blockers(workflow)
     if blockers:
-        raise HTTPException(status_code=409, detail="Resolve every review detail before scheduling.")
+        raise HTTPException(status_code=409, detail="Resolve every review detail before setting this job.")
     conversation = load_review_conversation(recording_dir)
     state, _current_blockers, _thread = _derived_review_state(
         workflow=workflow,
@@ -1539,47 +1351,23 @@ def _schedule_recording_locked(
         compiler=modules["compiler"],
     )
     if state != "ready_to_schedule":
-        raise HTTPException(status_code=409, detail="Finish the workflow review before scheduling.")
+        raise HTTPException(status_code=409, detail="Finish the workflow review before setting this job.")
 
-    execution = workflow.get("execution") if isinstance(workflow.get("execution"), dict) else {}
-    requested_authorization = (
-        body.authorization
-        if isinstance(body.authorization, dict)
-        else execution.get("authorization")
-    )
-    try:
-        authorization = modules["compiler"].validate_authorization_selection(
-            execution,
-            requested_authorization,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    install_readiness = crunch_install_readiness(
-        home=home,
-        authorization=authorization,
-        run_mode=body.run_mode,
-    )
-    if not install_readiness["ready"]:
-        blocker = next(
-            (
-                item
-                for item in install_readiness["blockers"]
-                if isinstance(item, dict) and item.get("message")
-            ),
-            {},
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=str(blocker.get("message") or "The workflow is not ready to install."),
-        )
-
-    authorization_args: Dict[str, Any] = {
-        "authorization_override": prepare_install_authorization(
-            home=home,
-            authorization=authorization,
-        )
-    }
+    if run_mode == "webhook" and body.publish:
+        try:
+            webhook_status = modules["hermes"].webhook_runtime_status(
+                hermes_home=home
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not webhook_status.get("ready"):
+            raise HTTPException(
+                status_code=409,
+                detail=str(
+                    webhook_status.get("reason")
+                    or "The webhook receiver is not ready for external events."
+                ),
+            )
 
     try:
         draft = compile_reviewed_recording(
@@ -1587,61 +1375,62 @@ def _schedule_recording_locked(
             home=home,
             profile_name=profile_name,
             recording_dir=recording_dir,
-            schedule=body.schedule,
-            run_mode=body.run_mode,
+            schedule=schedule if run_mode == "schedule" else "",
+            run_mode=run_mode,
             expected_draft_digest=body.expected_draft_digest,
-            **authorization_args,
         )
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("Crunch recording schedule failed during draft")
+        log.exception("Record recording schedule failed during draft")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     response = dict(draft)
     response["install"] = None
-    if not body.approve:
-        response["run_mode"] = body.run_mode.strip().lower()
-        response["status"] = "awaiting_approval"
+    if not body.publish:
+        response["run_mode"] = run_mode
+        response["status"] = "review_ready"
         return response
-    if (
-        body.expected_approval_envelope_sha256
-        != draft.get("approval_envelope_sha256")
+    expected_review_envelope_sha256 = (
+        str(draft.get("review_envelope_sha256") or "")
+        if publish_current_build
+        else str(body.expected_review_envelope_sha256 or "")
+    )
+    if expected_review_envelope_sha256 != draft.get(
+        "review_envelope_sha256"
     ):
         raise HTTPException(
             status_code=409,
-            detail="The executable payload changed. Review the new approval envelope.",
+            detail="The executable payload changed. Review the new setup.",
         )
     try:
-        install = install_crunch_build(
+        install = publish_record_build(
             modules,
             home=home,
             profile_name=profile_name,
             build_dir=Path(str(draft["build_dir"])),
-            note="Approved from Workflows",
-            expected_approval_envelope_sha256=str(
-                body.expected_approval_envelope_sha256 or ""
-            ),
+            note="Reviewed and set as a Hermes job from Workflows",
+            expected_review_envelope_sha256=expected_review_envelope_sha256,
             webhook_trigger=(
-                workflow.get("trigger")
-                if body.run_mode.strip().lower() == "webhook"
-                and isinstance(workflow.get("trigger"), dict)
+                draft["workflow"].get("trigger")
+                if run_mode == "webhook"
+                and isinstance(draft["workflow"].get("trigger"), dict)
                 else None
             ),
         )
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("Crunch recording schedule failed during install")
+        log.exception("Record recording schedule failed during install")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     response["install"] = install
     native = install.get("install") if isinstance(install.get("install"), dict) else {}
     response["job_id"] = native.get("job_id")
-    response["run_mode"] = body.run_mode.strip().lower()
+    response["run_mode"] = run_mode
     response["webhook"] = install.get("webhook")
     response["cron_url"] = f"/cron?profile={profile_name}"
     response["status"] = "installed"
     try:
         _mark_recording_scheduled(recording_dir, response["job_id"])
     except Exception:
-        log.exception("Crunch workflow installed but its recording lifecycle marker could not be updated")
+        log.exception("Record workflow installed but its recording lifecycle marker could not be updated")
     return response

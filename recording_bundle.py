@@ -16,20 +16,20 @@ REQUIRED_RECORDING_FILES = ("metadata.json", "session.json", "trace.jsonl")
 OPTIONAL_RECOVERY_JSON_FILES = ("workflow.json", "review-conversation.json")
 
 
-def crunch_root(home: Path) -> Path:
-    root = home / "crunch"
+def record_root(home: Path) -> Path:
+    root = home / "record"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def builds_root(home: Path) -> Path:
-    root = crunch_root(home) / "builds"
+    root = record_root(home) / "builds"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def recordings_root(home: Path) -> Path:
-    root = crunch_root(home) / "recordings"
+    root = record_root(home) / "recordings"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -57,7 +57,7 @@ def safe_recording_dir(home: Path, raw: str, *, require_bundle: bool = True) -> 
     try:
         path.relative_to(root)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="recording_dir must be under the profile Crunch recordings directory") from exc
+        raise HTTPException(status_code=400, detail="recording_dir must be under the profile Record recordings directory") from exc
     if not path.is_dir():
         raise HTTPException(status_code=404, detail="Hermes workflow trace recording directory not found")
     if require_bundle and not is_trace_recording_dir(path):
@@ -161,16 +161,6 @@ def recording_bundle_diagnostic(home: Path, recording_dir: Path) -> Dict[str, An
         "errors": errors,
         **lifecycle,
     }
-
-
-def enumerate_recording_bundles(home: Path) -> List[Dict[str, Any]]:
-    """Return healthy and malformed bundles side by side."""
-
-    return [
-        recording_bundle_diagnostic(home, path)
-        for path in sorted(recordings_root(home).glob("*/*"))
-        if path.is_dir()
-    ]
 
 
 def read_json(path: Path) -> Dict[str, Any]:

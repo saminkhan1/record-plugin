@@ -2,24 +2,28 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import threading
+import uuid
 from pathlib import Path
 
 import pytest
 
-_CAPTURE_AUTHORIZATION = {
-    "capture_authorization_nonce": "a" * 64,
-    "capture_dashboard_origin": "http://127.0.0.1:9119",
-}
+_CAPTURE_AUTHORIZATION = {"capture_authorization_nonce": "a" * 64}
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_recorder_module():
     module_path = PLUGIN_ROOT / "hermes_recorder.py"
-    spec = importlib.util.spec_from_file_location("hermes_crunch_recorder_under_test", module_path)
+    module_name = f"hermes_plugins.record._recorder_test_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(mod)
+    sys.modules[module_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop(module_name, None)
     return mod
 
 
@@ -58,22 +62,11 @@ def _write_trace_bundle(mod, recording: Path, *, status: str = "recording", acti
     )
 
 
-@pytest.mark.parametrize(
-    ("nonce", "origin"),
-    [
-        ("short", "http://127.0.0.1:9119"),
-        ("g" * 64, "http://127.0.0.1:9119"),
-        ("a" * 64, "https://127.0.0.1:9119"),
-        ("a" * 64, "http://127.0.0.1"),
-        ("a" * 64, "http://127.0.0.1:9119/workflows"),
-        ("a" * 64, "http://example.test:9119"),
-    ],
-)
+@pytest.mark.parametrize("nonce", ["short", "g" * 64])
 def test_start_rejects_untrusted_capture_authorization_before_claim(
     tmp_path,
     monkeypatch,
     nonce,
-    origin,
 ):
     mod = _load_recorder_module()
 
@@ -91,12 +84,11 @@ def test_start_rejects_untrusted_capture_authorization_before_claim(
             instructions="Delete spam.",
             schedule="every 1h",
             capture_authorization_nonce=nonce,
-            capture_dashboard_origin=origin,
         )
 
     assert exc.value.status_code == 409
     assert exc.value.detail == mod._CAPTURE_AUTHORIZATION_BLOCK_DETAIL
-    assert not (tmp_path / "crunch").exists()
+    assert not (tmp_path / "record").exists()
 
 
 def test_native_client_prefers_explicit_client(tmp_path, monkeypatch):
@@ -158,7 +150,7 @@ def test_open_macos_privacy_settings_targets_first_missing_permission(permission
 def test_active_native_recording_passively_reports_scoped_recording(tmp_path, monkeypatch):
     mod = _load_recorder_module()
     client = _dev_client(mod)
-    recording = tmp_path / "crunch" / "recordings" / "active-workflow" / "rec-1"
+    recording = tmp_path / "record" / "recordings" / "active-workflow" / "rec-1"
     _write_trace_bundle(
         mod,
         recording,
@@ -183,7 +175,6 @@ def test_active_native_recording_passively_reports_scoped_recording(tmp_path, mo
         }
 
     monkeypatch.setattr(mod, "_native_client_path", lambda: client)
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     monkeypatch.setattr(mod, "_reconcile_scoped_recorder_service", passive_scan)
 
     result = mod.active_native_recording(home=tmp_path, profile_name="default")
@@ -201,7 +192,7 @@ def test_active_native_recording_passively_reports_scoped_recording(tmp_path, mo
 def test_reconcile_scoped_service_terminates_only_idle_services_in_active_profile(tmp_path, monkeypatch):
     mod = _load_recorder_module()
     client = _dev_client(mod)
-    recordings_root = tmp_path / "crunch" / "recordings"
+    recordings_root = tmp_path / "record" / "recordings"
     idle_root = recordings_root / "idle-workflow"
     active_root = recordings_root / "active-workflow"
     active_session = active_root / "active-session"
@@ -238,7 +229,6 @@ def test_reconcile_scoped_service_terminates_only_idle_services_in_active_profil
     passive = mod._reconcile_scoped_recorder_service(
         scope_root=recordings_root,
         client=client,
-        remote_reason=None,
         trigger=False,
     )
     assert passive["reason"] == "active_recordings_left_running"
@@ -249,7 +239,6 @@ def test_reconcile_scoped_service_terminates_only_idle_services_in_active_profil
     repair = mod._reconcile_scoped_recorder_service(
         scope_root=recordings_root,
         client=client,
-        remote_reason=None,
         trigger=True,
     )
     assert repair["reason"] == "terminated_idle_scoped_processes"
@@ -262,13 +251,12 @@ def test_start_repairs_profile_scope_and_blocks_existing_active_recording(tmp_pa
     repair_calls = []
 
     monkeypatch.setattr(mod, "_require_native_client", lambda: _dev_client(mod))
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     monkeypatch.setattr(
         mod,
         "_reconcile_scoped_recorder_service",
         lambda **kwargs: repair_calls.append(kwargs) or {
             "reason": "active_recordings_left_running",
-            "activeSessions": [{"pid": 42, "root": str(tmp_path / "crunch" / "recordings" / "other")}],
+            "activeSessions": [{"pid": 42, "root": str(tmp_path / "record" / "recordings" / "other")}],
             "terminated": [],
         },
     )
@@ -286,7 +274,7 @@ def test_start_repairs_profile_scope_and_blocks_existing_active_recording(tmp_pa
 
     assert exc.value.status_code == 409
     assert repair_calls
-    assert repair_calls[0]["scope_root"] == tmp_path / "crunch" / "recordings"
+    assert repair_calls[0]["scope_root"] == tmp_path / "record" / "recordings"
     assert repair_calls[0]["trigger"] is True
 
 
@@ -393,7 +381,6 @@ def test_start_native_recording_requests_permissions_then_blocks_without_bundle(
         raise AssertionError(f"unexpected recorder action {action}")
 
     monkeypatch.setattr(mod, "_require_native_client", lambda: _dev_client(mod))
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     monkeypatch.setattr(
         mod,
         "_reconcile_scoped_recorder_service",
@@ -427,9 +414,9 @@ def test_start_native_recording_requests_permissions_then_blocks_without_bundle(
     assert "Input Monitoring" in exc.value.detail
     assert actions == ["permission-status", "request-permissions", "open-settings"]
     assert opened == []
-    assert not (tmp_path / "crunch" / "recordings" / "delete-spam").exists()
+    assert not (tmp_path / "record" / "recordings" / "delete-spam").exists()
 
-def test_start_native_recording_hides_native_controls_for_dashboard(tmp_path, monkeypatch):
+def test_start_native_recording_hides_native_controls_for_desktop(tmp_path, monkeypatch):
     mod = _load_recorder_module()
     calls = []
 
@@ -477,7 +464,6 @@ def test_start_native_recording_hides_native_controls_for_dashboard(tmp_path, mo
         return {"eventStreamRootPath": str(recording)}
 
     monkeypatch.setattr(mod, "_require_native_client", lambda: _dev_client(mod))
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     monkeypatch.setattr(
         mod,
         "_reconcile_scoped_recorder_service",
@@ -498,11 +484,11 @@ def test_start_native_recording_hides_native_controls_for_dashboard(tmp_path, mo
         **_CAPTURE_AUTHORIZATION,
     )
 
-    assert calls[0]["root"] == tmp_path / "crunch" / "recordings" / "delete-spam"
+    assert calls[0]["root"] == tmp_path / "record" / "recordings" / "delete-spam"
     assert calls[0]["show_controls"] is False
     assert result["status"] == "recording"
     metadata = json.loads((Path(result["recording_dir"]) / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["source"] == "dashboard"
+    assert metadata["source"] == "desktop-plugin"
     assert "capture_consent" not in metadata
     assert list(Path(result["recording_dir"]).glob(".start-readiness-*")) == []
 
@@ -547,7 +533,6 @@ def test_start_native_recording_requires_chrome_provider_ready(tmp_path, monkeyp
         return {"permissionState": {"platform": "macos"}}
 
     monkeypatch.setattr(mod, "_require_native_client", lambda: _dev_client(mod))
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     monkeypatch.setattr(
         mod,
         "_reconcile_scoped_recorder_service",
@@ -583,7 +568,7 @@ def test_start_native_recording_requires_chrome_provider_ready(tmp_path, monkeyp
     assert mod._START_CHROME_PROVIDER_BLOCK_DETAIL in exc.value.detail
     assert "extension is not loaded" in exc.value.detail
     assert actions == []
-    assert not (tmp_path / "crunch" / "recordings" / "delete-spam").exists()
+    assert not (tmp_path / "record" / "recordings" / "delete-spam").exists()
 
 
 def test_start_native_recording_requests_permissions_then_starts_when_granted(tmp_path, monkeypatch):
@@ -636,7 +621,6 @@ def test_start_native_recording_requests_permissions_then_starts_when_granted(tm
         return {"eventStreamRootPath": str(recording)}
 
     monkeypatch.setattr(mod, "_require_native_client", lambda: _dev_client(mod))
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     monkeypatch.setattr(
         mod,
         "_reconcile_scoped_recorder_service",
@@ -664,7 +648,7 @@ def test_start_native_recording_requests_permissions_then_starts_when_granted(tm
 
 def test_recording_status_finalizes_chrome_after_native_controls_stop(tmp_path, monkeypatch):
     mod = _load_recorder_module()
-    recording = tmp_path / "crunch" / "recordings" / "delete-spam" / "rec-1"
+    recording = tmp_path / "record" / "recordings" / "delete-spam" / "rec-1"
     chrome_dir = recording / "chrome"
     chrome_dir.mkdir(parents=True)
     _write_trace_bundle(
@@ -679,7 +663,6 @@ def test_recording_status_finalizes_chrome_after_native_controls_stop(tmp_path, 
     monkeypatch.setattr(mod, "deactivate_chrome_capture", lambda **kwargs: finalized.append(kwargs) or {})
     monkeypatch.setattr(mod, "_reconcile_scoped_recorder_service", lambda **_kwargs: {"reason": "no_idle_processes"})
     monkeypatch.setattr(mod, "_native_client_path", lambda: _dev_client(mod))
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
 
     status = mod.recording_status(home=tmp_path, recording_dir=recording)
 
@@ -690,7 +673,7 @@ def test_recording_status_finalizes_chrome_after_native_controls_stop(tmp_path, 
 
 def test_stop_promotes_real_native_active_video_contract(tmp_path, monkeypatch):
     mod = _load_recorder_module()
-    recording = tmp_path / "crunch" / "recordings" / "complete" / "rec-1"
+    recording = tmp_path / "record" / "recordings" / "complete" / "rec-1"
     _write_trace_bundle(mod, recording)
     timestamp = "2026-07-06T01:48:37Z"
     (recording / "trace.jsonl").write_text(
@@ -738,7 +721,6 @@ def test_stop_promotes_real_native_active_video_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "_run_client", stop_client)
     monkeypatch.setattr(mod, "deactivate_chrome_capture", lambda **_kwargs: None)
     monkeypatch.setattr(mod, "_reconcile_scoped_recorder_service", lambda **_kwargs: {"reason": "no_idle_processes"})
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     status = mod.stop_native_recording(home=tmp_path, recording_dir=recording)
 
     metadata = json.loads((recording / "metadata.json").read_text(encoding="utf-8"))
@@ -752,7 +734,7 @@ def test_stop_promotes_real_native_active_video_contract(tmp_path, monkeypatch):
 
 def test_stop_preserves_unready_v3_capture_and_returns_stopped_status(tmp_path, monkeypatch):
     mod = _load_recorder_module()
-    recording = tmp_path / "crunch" / "recordings" / "target-gap" / "rec-1"
+    recording = tmp_path / "record" / "recordings" / "target-gap" / "rec-1"
     _write_trace_bundle(
         mod,
         recording,
@@ -790,7 +772,6 @@ def test_stop_preserves_unready_v3_capture_and_returns_stopped_status(tmp_path, 
     monkeypatch.setattr(mod, "_run_client", stop_client)
     monkeypatch.setattr(mod, "deactivate_chrome_capture", lambda **_kwargs: None)
     monkeypatch.setattr(mod, "_reconcile_scoped_recorder_service", lambda **_kwargs: {"reason": "no_idle_processes"})
-    monkeypatch.setattr(mod, "_remote_backend_reason", lambda: None)
     status = mod.stop_native_recording(
         home=tmp_path,
         recording_dir=recording,
@@ -832,9 +813,9 @@ def test_live_chrome_join_requires_content_script_and_attached_target(tmp_path):
 
 def test_scoped_recorder_process_filter_stays_under_profile_root(tmp_path):
     mod = _load_recorder_module()
-    scope = tmp_path / "profile" / "crunch" / "recordings"
+    scope = tmp_path / "profile" / "record" / "recordings"
     inside = scope / "workflow-a"
-    outside = tmp_path / "other-profile" / "crunch" / "recordings" / "workflow-b"
+    outside = tmp_path / "other-profile" / "record" / "recordings" / "workflow-b"
     rows = [
         {"pid": 101, "command": f"hermes-recorder-service --root {inside} --socket /tmp/inside.sock"},
         {"pid": 202, "command": f"hermes-recorder-service --root {outside} --socket /tmp/outside.sock"},

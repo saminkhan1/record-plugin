@@ -18,7 +18,7 @@ test('Web Store manifest uses the reviewed 128px app icon', () => {
     .map(character => String.fromCharCode('a'.charCodeAt(0) + Number.parseInt(character, 16)))
     .join('')
 
-  assert.equal(manifest.name, 'Hermes Chrome Provider BETA')
+  assert.equal(manifest.name, 'Record Chrome Provider BETA')
   assert.match(manifest.description, /^THIS EXTENSION IS FOR BETA TESTING\./)
   assert.ok(['bootstrap-required', 'assigned'].includes(identity.status))
   if (identity.status === 'bootstrap-required') {

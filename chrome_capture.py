@@ -1,4 +1,4 @@
-"""Chrome adaptive capture provider logs for Hermes Crunch recordings."""
+"""Chrome adaptive capture provider logs for Record recordings."""
 
 from __future__ import annotations
 
@@ -17,32 +17,29 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-PLUGIN_ROOT = Path(__file__).resolve().parent
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
-
-
 try:
     from hermes_constants import get_default_hermes_root
 except Exception:  # pragma: no cover - native host can run from a thin env
     get_default_hermes_root = None  # type: ignore[assignment]
 
-from hermes_crunch.trace_schema import (  # noqa: E402 - standalone host bootstrap
-    is_recorder_dashboard_url,
+from .record.trace_schema import (
     normalize_trace_row,
     utc_now,
     url_origin,
 )
+
+PLUGIN_ROOT = Path(__file__).resolve().parent
 
 
 HOST_NAME = "com.hermes.chrome_capture"
 ACTIVE_STATE_FILENAME = "chrome-capture-active.json"
 CHROME_CAPTURE_SCHEMA = "hermes-chrome-provider-v1"
 ADAPTIVE_CAPTURE_SCHEMA = "hermes-adaptive-capture-v1"
-CHROME_PROTOCOL_VERSION = 3
+CHROME_PROTOCOL_VERSION = 4
 CAPTURE_STATE_FILENAME = "capture-state.json"
 MAX_SCREENSHOT_COUNT = 40
 MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
+DESKTOP_CAPTURE_AUTHORITY_SOURCE = "desktop"
 
 
 def active_chrome_recording(home: Path) -> Dict[str, Any]:
@@ -67,11 +64,21 @@ def activate_chrome_capture(
     workflow_id: str,
     title: str,
     capture_authorization_sha256: str,
-    capture_dashboard_origin: str,
+    capture_authorization: str,
 ) -> Dict[str, Any]:
-    """Publish the active Crunch recording for the Chrome Native Messaging host."""
+    """Publish a Desktop-authorized recording for the Chrome Native Messaging host."""
 
     recording_dir = recording_dir.expanduser().resolve()
+    raw_authorization = str(capture_authorization or "").strip().lower()
+    if (
+        len(raw_authorization) != 64
+        or any(character not in "0123456789abcdef" for character in raw_authorization)
+        or not hmac.compare_digest(
+            hashlib.sha256(raw_authorization.encode("ascii")).hexdigest(),
+            capture_authorization_sha256,
+        )
+    ):
+        raise ValueError("Desktop Chrome capture authorization is invalid")
     state = {
         "schemaVersion": CHROME_CAPTURE_SCHEMA,
         "active": True,
@@ -81,7 +88,8 @@ def activate_chrome_capture(
         "workflow_id": workflow_id,
         "title": title,
         "capture_authorization_sha256": capture_authorization_sha256,
-        "capture_dashboard_origin": capture_dashboard_origin,
+        "capture_authority_source": DESKTOP_CAPTURE_AUTHORITY_SOURCE,
+        "desktop_capture_authorization": raw_authorization,
         "started_at": utc_now(),
         "updated_at": utc_now(),
     }
@@ -98,6 +106,10 @@ def activate_chrome_capture(
     active_path = _active_state_path(home)
     if active_path:
         _write_json(active_path, state)
+        try:
+            os.chmod(active_path, 0o600)
+        except OSError:
+            pass
     _patch_recording_metadata(
         recording_dir,
         {
@@ -152,6 +164,62 @@ def deactivate_chrome_capture(*, home: Path, recording_dir: Path) -> Dict[str, A
         },
     )
     return manifest
+
+
+def request_desktop_chrome_finalize(
+    *,
+    home: Path,
+    recording_dir: Path,
+) -> Dict[str, Any]:
+    """Publish one recording-scoped finalize request for the Chrome extension."""
+
+    recording_dir = recording_dir.expanduser().resolve()
+    path = _active_state_path(home)
+    if path is None or not path.is_file():
+        raise RuntimeError("No active Chrome capture is available")
+    state = _read_optional_json(path)
+    if (
+        state.get("active") is not True
+        or state.get("capture_authority_source")
+        != DESKTOP_CAPTURE_AUTHORITY_SOURCE
+        or str(state.get("recording_dir") or "") != str(recording_dir)
+    ):
+        raise RuntimeError("Desktop Chrome capture is not active for this recording")
+    request = {
+        "id": uuid.uuid4().hex,
+        "recordingId": str(
+            _read_capture_state(recording_dir).get("sessionID")
+            or recording_dir.name
+        ),
+        "requested_at": utc_now(),
+    }
+    state["desktop_finalize_request"] = request
+    state.pop("desktop_finalize_ack", None)
+    state["updated_at"] = utc_now()
+    _write_json(path, state)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return request
+
+
+def desktop_chrome_finalize_ack(
+    *,
+    home: Path,
+    recording_dir: Path,
+    request_id: str,
+) -> Dict[str, Any]:
+    path = _active_state_path(home)
+    state = _read_optional_json(path) if path else {}
+    if str(state.get("recording_dir") or "") != str(
+        recording_dir.expanduser().resolve()
+    ):
+        return {}
+    ack = state.get("desktop_finalize_ack")
+    if not isinstance(ack, dict) or str(ack.get("id") or "") != request_id:
+        return {}
+    return ack
 
 
 def init_chrome_bundle(recording_dir: Path, state: Dict[str, Any]) -> None:
@@ -246,7 +314,17 @@ def chrome_provider_preflight() -> Dict[str, Any]:
     candidate_extension_ids = list(allowed_extension_ids)
     if expected_extension_id and expected_extension_id not in candidate_extension_ids:
         candidate_extension_ids.append(expected_extension_id)
-    detected_extensions = _installed_chrome_extension_ids(candidate_extension_ids)
+    detected_extensions = _installed_chrome_extensions(candidate_extension_ids)
+    detected_extension_ids = list(dict.fromkeys(
+        str(item.get("extensionId") or "")
+        for item in detected_extensions
+        if item.get("extensionId")
+    ))
+    expected_extension_loaded = any(
+        item.get("extensionId") == expected_extension_id
+        and item.get("extensionVersion") == expected_extension_version
+        for item in detected_extensions
+    )
     needs_attention = []
     if not installed_manifests:
         needs_attention.append("Hermes Chrome provider native host is not installed.")
@@ -264,12 +342,17 @@ def chrome_provider_preflight() -> Dict[str, Any]:
             "Hermes Chrome provider packaged identity is missing or invalid. "
             "Reinstall the current Hermes release."
         )
-    if not detected_extensions:
+    if not detected_extension_ids:
         needs_attention.append("Hermes Chrome provider extension is not loaded in Chrome.")
-    elif expected_extension_id and expected_extension_id not in detected_extensions:
+    elif expected_extension_id and expected_extension_id not in detected_extension_ids:
         needs_attention.append(
             "The current Hermes Chrome Provider extension is not loaded in Chrome. "
             "Reload or reinstall the current provider."
+        )
+    elif not expected_extension_loaded:
+        needs_attention.append(
+            "Chrome has an older Hermes Chrome Provider build loaded. "
+            "Reload or reinstall the packaged provider."
         )
 
     return {
@@ -281,8 +364,9 @@ def chrome_provider_preflight() -> Dict[str, Any]:
         "hostPath": host_path,
         "hostPathExists": host_path_exists,
         "allowedExtensionIds": allowed_extension_ids,
-        "extensionDetected": bool(detected_extensions),
-        "detectedExtensionIds": detected_extensions,
+        "extensionDetected": bool(detected_extension_ids),
+        "detectedExtensionIds": detected_extension_ids,
+        "detectedExtensions": detected_extensions,
         "status": "ready" if not needs_attention else "needs_attention",
         "needs_attention": needs_attention,
     }
@@ -369,6 +453,8 @@ class ChromeNativeHost:
                 payload = self._append_trace_message(message, row_type="evidence")
             elif kind == "recording.finalize":
                 payload = self._finalize_recording(message)
+            elif kind == "desktop.finalize.ack":
+                payload = self._desktop_finalize_ack(message)
             elif kind == "screenshot":
                 payload = self._save_screenshot(message)
             else:
@@ -380,10 +466,10 @@ class ChromeNativeHost:
     def _active_recording(self) -> Dict[str, Any]:
         state = _resolve_active_state()
         if not state:
-            raise RuntimeError("No active Hermes Crunch recording is available for the Chrome provider")
+            raise RuntimeError("No active Record recording is available for the Chrome provider")
         recording_dir = Path(str(state.get("recording_dir") or "")).expanduser().resolve()
         if not _is_trace_recording_dir(recording_dir):
-            raise RuntimeError("Active Hermes Crunch recording is missing or incomplete")
+            raise RuntimeError("Active Record recording is missing or incomplete")
         init_chrome_bundle(recording_dir, state)
         return {**state, "recording_dir": str(recording_dir)}
 
@@ -399,17 +485,34 @@ class ChromeNativeHost:
             }
         recording_dir = Path(str(state.get("recording_dir") or "")).expanduser().resolve()
         capture_state = _read_capture_state(recording_dir)
-        return {
+        recording_id = str(capture_state.get("sessionID") or recording_dir.name)
+        payload = {
             "active": True,
             "schemaVersion": CHROME_CAPTURE_SCHEMA,
             "protocolVersion": CHROME_PROTOCOL_VERSION,
             **provider_identity,
             "recording_dir": str(recording_dir),
+            "recordingId": recording_id,
             "captureState": capture_state,
             "desiredProvider": capture_state.get("desiredProvider") or "native",
             "chromeSegmentActive": bool(capture_state.get("chromeSegmentActive")),
             "capture": chrome_capture_status(recording_dir),
         }
+        if (
+            state.get("capture_authority_source")
+            == DESKTOP_CAPTURE_AUTHORITY_SOURCE
+        ):
+            payload["desktopCaptureAuthority"] = {
+                "active": True,
+                "source": DESKTOP_CAPTURE_AUTHORITY_SOURCE,
+                "recordingId": recording_id,
+                "captureAuthorization": state.get(
+                    "desktop_capture_authorization"
+                ),
+                "finalizeRequest": state.get("desktop_finalize_request"),
+                "finalizeAck": state.get("desktop_finalize_ack"),
+            }
+        return payload
 
     def _segment_start(self, message: Dict[str, Any]) -> Dict[str, Any]:
         if not _resolve_active_state():
@@ -423,8 +526,7 @@ class ChromeNativeHost:
         recording_dir = Path(str(state["recording_dir"]))
         capture_state = _read_capture_state(recording_dir)
         desired = str(capture_state.get("desiredProvider") or "native")
-        dashboard_bootstrap = _is_authorized_dashboard_bootstrap(state, message)
-        if desired != "chrome" and not dashboard_bootstrap:
+        if desired != "chrome":
             capture_state = _write_capture_state(
                 recording_dir,
                 {
@@ -683,7 +785,6 @@ class ChromeNativeHost:
                     ((row.get("payload") or {}).get("browser") or {}).get("top_url"),
                     ((row.get("payload") or {}).get("browser") or {}).get("origin"),
                 ]
-                if not is_recorder_dashboard_url(candidate)
                 for origin in [url_origin(candidate) or str(candidate or "")]
                 if origin.startswith(("http://", "https://"))
             }
@@ -730,6 +831,51 @@ class ChromeNativeHost:
         _refresh_counts(recording_dir)
         return {"continuity": continuity}
 
+    def _desktop_finalize_ack(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        state = self._active_recording()
+        if (
+            state.get("capture_authority_source")
+            != DESKTOP_CAPTURE_AUTHORITY_SOURCE
+        ):
+            raise RuntimeError("Desktop finalization is not active")
+        recording_dir = Path(str(state["recording_dir"]))
+        capture_state = _read_capture_state(recording_dir)
+        self._validate_recording_identity(message, recording_dir, capture_state)
+        request = state.get("desktop_finalize_request")
+        request_id = str(message.get("requestId") or "")
+        if (
+            not isinstance(request, dict)
+            or not request_id
+            or request_id != str(request.get("id") or "")
+        ):
+            raise RuntimeError("Desktop finalization request does not match")
+        result = message.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("Desktop finalization result is invalid")
+        ack = {
+            "id": request_id,
+            "recordingId": message.get("recordingId"),
+            "received_at": utc_now(),
+            "result": result,
+        }
+        active_path = _active_state_path(None)
+        if active_path is None:
+            raise RuntimeError("Desktop finalization state is unavailable")
+        current = _read_optional_json(active_path)
+        if (
+            str(current.get("recording_dir") or "")
+            != str(recording_dir)
+        ):
+            raise RuntimeError("Desktop finalization recording changed")
+        current["desktop_finalize_ack"] = ack
+        current["updated_at"] = utc_now()
+        _write_json(active_path, current)
+        try:
+            os.chmod(active_path, 0o600)
+        except OSError:
+            pass
+        return {"finalizeAck": ack}
+
     def _save_screenshot(self, message: Dict[str, Any]) -> Dict[str, Any]:
         recording_dir = Path(str(self._active_recording()["recording_dir"]))
         capture_state = _read_capture_state(recording_dir)
@@ -774,7 +920,7 @@ class ChromeNativeHost:
         try:
             accepted = _append_trace_rows(recording_dir, [row])
             if not accepted:
-                raise RuntimeError("Hermes Crunch recording already stopped")
+                raise RuntimeError("Record recording already stopped")
         except Exception:
             path.unlink(missing_ok=True)
             raise
@@ -935,49 +1081,21 @@ def _validate_capture_authorization(
     message: Dict[str, Any],
 ) -> None:
     expected_digest = str(state.get("capture_authorization_sha256") or "")
-    expected_origin = str(state.get("capture_dashboard_origin") or "")
     authorization = str(message.get("captureAuthorization") or "")
-    dashboard_origin = str(message.get("dashboardOrigin") or "")
+    supplied_source = str(
+        message.get("captureAuthoritySource") or ""
+    ).strip().lower()
     supplied_digest = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
-    if (
+    invalid = (
         len(expected_digest) != 64
         or not authorization
-        or not expected_origin
+        or supplied_source != DESKTOP_CAPTURE_AUTHORITY_SOURCE
         or not hmac.compare_digest(supplied_digest, expected_digest)
-        or not hmac.compare_digest(dashboard_origin, expected_origin)
-    ):
+    )
+    if invalid:
         raise RuntimeError(
             "Chrome capture authorization does not match the active Hermes recording"
         )
-
-
-def _is_authorized_dashboard_bootstrap(
-    state: Dict[str, Any],
-    message: Dict[str, Any],
-) -> bool:
-    """Allow the initiating Workflows tab to win the recorder startup race.
-
-    macOS can briefly report UserNotificationCenter as frontmost while
-    ScreenCaptureKit finishes its picker/indicator transition. The extension
-    command is already bound to the recording nonce and dashboard origin, so
-    an attached, current Workflows content script is stronger evidence for the
-    initial Chrome lease than that transient native foreground sample. Native
-    foreground changes remain authoritative after the segment starts.
-    """
-
-    url = str(message.get("url") or message.get("activeUrl") or "")
-    return (
-        message.get("protocolVersion") == CHROME_PROTOCOL_VERSION
-        and message.get("contentScriptReady") is True
-        and message.get("activeTargetAttached") is True
-        and isinstance(message.get("tabId") or message.get("activeTabId"), int)
-        and isinstance(message.get("windowId") or message.get("activeWindowId"), int)
-        and is_recorder_dashboard_url(url)
-        and hmac.compare_digest(
-            url_origin(url),
-            str(state.get("capture_dashboard_origin") or ""),
-        )
-    )
 
 
 def _trace_context_row(kind: str, message: Dict[str, Any], capture_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1173,7 +1291,7 @@ def _active_state_path(home: Optional[Path]) -> Optional[Path]:
     root = _default_root_for_home(home)
     if root is None:
         return None
-    return root.expanduser().resolve() / "crunch" / ACTIVE_STATE_FILENAME
+    return root.expanduser().resolve() / "record" / ACTIVE_STATE_FILENAME
 
 
 def _default_root_for_home(home: Optional[Path]) -> Optional[Path]:
@@ -1219,8 +1337,8 @@ def _native_host_manifest_paths() -> List[Path]:
         roots = [
             Path.home() / "Library" / "Application Support" / "Google" / "Chrome" / "NativeMessagingHosts",
         ]
-        if os.environ.get("HERMES_CRUNCH_TART_MANUAL") == "1":
-            roots.insert(0, Path.home() / ".hermes-crunch-clean-chrome" / "NativeMessagingHosts")
+        if os.environ.get("HERMES_RECORD_TART_MANUAL") == "1":
+            roots.insert(0, Path.home() / ".record-clean-chrome" / "NativeMessagingHosts")
     elif sys.platform == "win32":
         roots = []
     else:
@@ -1271,30 +1389,61 @@ def _extension_identity_from_manifest(manifest_path: Path) -> Dict[str, str]:
     }
 
 
-def _installed_chrome_extension_ids(extension_ids: List[str]) -> List[str]:
+def _installed_chrome_extensions(extension_ids: List[str]) -> List[Dict[str, str]]:
     wanted = {item for item in extension_ids if item}
     if not wanted:
         return []
-    detected: List[str] = []
+    detected: Dict[Tuple[str, str], Dict[str, str]] = {}
     for preferences in _chrome_preferences_paths():
         data = _read_optional_json(preferences)
         settings = data.get("extensions", {}).get("settings", {}) if isinstance(data.get("extensions"), dict) else {}
         if not isinstance(settings, dict):
             continue
         for extension_id, info in settings.items():
-            if extension_id not in wanted or extension_id in detected:
+            if extension_id not in wanted:
                 continue
             if isinstance(info, dict) and info.get("state") == 0:
                 continue
-            detected.append(extension_id)
+            if not isinstance(info, dict):
+                continue
+            raw_path = str(info.get("path") or "").strip()
+            extension_root = Path(raw_path).expanduser() if raw_path else None
+            if extension_root is not None and not extension_root.is_absolute():
+                extension_root = preferences.parent / "Extensions" / extension_root
+            manifest = (
+                _read_optional_json(extension_root / "manifest.json")
+                if extension_root is not None
+                else {}
+            )
+            if not manifest and isinstance(info.get("manifest"), dict):
+                manifest = info["manifest"]
+            profile = preferences.parent.name
+            key = (profile, extension_id)
+            record = {
+                "extensionId": extension_id,
+                "extensionVersion": str(manifest.get("version") or ""),
+                "profile": profile,
+                "source": "preferences",
+            }
+            existing = detected.get(key)
+            if existing is None or (
+                not existing.get("extensionVersion")
+                and record["extensionVersion"]
+            ):
+                detected[key] = record
     for extension_id in _live_devtools_extension_ids(wanted):
-        if extension_id not in detected:
-            detected.append(extension_id)
-    return detected
+        if not any(item["extensionId"] == extension_id for item in detected.values()):
+            detected[("devtools", extension_id)] = {
+                "extensionId": extension_id,
+                "extensionVersion": "",
+                "profile": "devtools",
+                "source": "devtools",
+            }
+    return list(detected.values())
 
 
 def _live_devtools_extension_ids(wanted: set[str]) -> List[str]:
-    if os.environ.get("HERMES_CRUNCH_TART_MANUAL") != "1":
+    if os.environ.get("HERMES_RECORD_TART_MANUAL") != "1":
         return []
     try:
         with urllib.request.urlopen("http://127.0.0.1:9222/json/list", timeout=0.5) as response:
@@ -1324,9 +1473,41 @@ def _chrome_preferences_paths() -> List[Path]:
     for root in roots:
         if not root.is_dir():
             continue
-        paths.extend(sorted(root.glob("*/Preferences")))
-        paths.extend(sorted(root.glob("*/Secure Preferences")))
-    return paths
+        local_state = _read_optional_json(root / "Local State")
+        profile_state = (
+            local_state.get("profile")
+            if isinstance(local_state.get("profile"), dict)
+            else {}
+        )
+        active_names = [
+            str(item)
+            for item in profile_state.get("last_active_profiles", [])
+            if isinstance(item, str)
+        ]
+        last_used = str(profile_state.get("last_used") or "")
+        if last_used and last_used not in active_names:
+            active_names.append(last_used)
+        profile_roots = []
+        for name in active_names:
+            candidate = root / name
+            if (
+                name
+                and name not in {".", ".."}
+                and Path(name).name == name
+                and candidate.is_dir()
+            ):
+                profile_roots.append(candidate)
+        if not profile_roots:
+            profile_roots = sorted(
+                path.parent
+                for path in root.glob("*/Preferences")
+            )
+        for profile_root in profile_roots:
+            paths.extend([
+                profile_root / "Preferences",
+                profile_root / "Secure Preferences",
+            ])
+    return [path for path in paths if path.is_file()]
 
 
 def _safe_id(value: Any) -> str:

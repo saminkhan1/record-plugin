@@ -1,11 +1,20 @@
 {
-  "name": "hermes-crunch-plugin",
+  "name": "record-plugin",
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "build": "npm run build:dashboard && npm run build:desktop",
     "build:dashboard": "node scripts/build-dashboard.mjs",
-    "test:dashboard": "node --test dashboard/test/*.test.js",
+    "build:desktop": "npm --prefix desktop-plugin run build",
+    "build:recorder": "node scripts/build-recorder.mjs",
+    "package:chrome": "npm run test:chrome && node scripts/package-chrome.mjs",
+    "package:mac": "npm run build && npm run build:recorder && node scripts/package-mac.mjs",
+    "notarize:mac": "node scripts/notarize-mac.mjs",
+    "install:mac": "python3 scripts/install-mac.py",
     "test:chrome": "npm --prefix chrome_capture/extension test",
-    "test": "npm run test:dashboard && npm run test:chrome"
+    "test": "npm run test:chrome"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

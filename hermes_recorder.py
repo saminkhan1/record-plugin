@@ -1,4 +1,4 @@
-"""V2 workflow trace native recorder bridge for Hermes Crunch."""
+"""V2 workflow trace native recorder bridge for Record."""
 
 from __future__ import annotations
 
@@ -11,28 +11,26 @@ import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit
 
 import psutil
 from fastapi import HTTPException
-PLUGIN_ROOT = Path(__file__).resolve().parent
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
+from hermes_constants import get_default_hermes_root
 
-from chrome_capture import (  # noqa: E402
+from .chrome_capture import (
     _active_state_path as chrome_active_state_path,
     active_chrome_recording,
     activate_chrome_capture,
     chrome_provider_preflight,
     deactivate_chrome_capture,
+    desktop_chrome_finalize_ack,
+    request_desktop_chrome_finalize,
 )
-from recording_bundle import (  # noqa: E402
+from .recording_bundle import (
     is_trace_recording_dir,
     read_json,
     read_jsonl,
@@ -40,19 +38,21 @@ from recording_bundle import (  # noqa: E402
     recordings_root,
     write_json,
 )
-from hermes_crunch.trace_schema import SCHEMA_VERSION, utc_now  # noqa: E402
-from hermes_crunch.evidence import (  # noqa: E402
+from .record.trace_schema import SCHEMA_VERSION, utc_now
+from .record.evidence import (
     build_evidence_pack,
     capture_completeness,
     finalize_evidence_pack,
     seal_capture,
 )
 
+PLUGIN_ROOT = Path(__file__).resolve().parent
+
 
 log = logging.getLogger(__name__)
 RECORDER_SCHEMA = SCHEMA_VERSION
 _CAPTURE_AUTHORIZATION_BLOCK_DETAIL = (
-    "The recording page could not establish a trusted Chrome capture authorization."
+    "Hermes Desktop could not establish a trusted Chrome capture authorization."
 )
 
 _PERMISSION_UNAVAILABLE_MESSAGE = "Native recorder permission status is unavailable. Hermes will request permissions before recording."
@@ -63,52 +63,13 @@ _START_PERMISSION_BLOCK_DETAIL = (
 _START_CHROME_PROVIDER_BLOCK_DETAIL = "Hermes Chrome provider must be ready before recording."
 _START_CHROME_LIVE_BLOCK_DETAIL = (
     "Hermes Chrome provider is installed but its page recorder did not join the recording. "
-    "Reload the Hermes Chrome Provider extension and the Workflows page, then try again."
+    "Reload the Hermes Chrome Provider extension, then try again."
 )
 _LIVE_CHROME_JOIN_TIMEOUT_SECONDS = 4.0
 _LIVE_CHROME_JOIN_POLL_SECONDS = 0.05
 _NATIVE_CAPTURE_READY_TIMEOUT_SECONDS = 8.0
 
 
-def _validated_capture_authorization(
-    nonce: str,
-    dashboard_origin: str,
-) -> tuple[str, str]:
-    normalized_nonce = str(nonce or "").strip().lower()
-    if (
-        len(normalized_nonce) != 64
-        or any(character not in "0123456789abcdef" for character in normalized_nonce)
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=_CAPTURE_AUTHORIZATION_BLOCK_DETAIL,
-        )
-    normalized_origin = str(dashboard_origin or "").strip()
-    try:
-        parsed = urlsplit(normalized_origin)
-        hostname = str(parsed.hostname or "").lower()
-        port = parsed.port
-    except (TypeError, ValueError):
-        parsed = None
-        hostname = ""
-        port = None
-    if (
-        parsed is None
-        or parsed.scheme != "http"
-        or hostname not in {"127.0.0.1", "localhost", "::1"}
-        or port is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=_CAPTURE_AUTHORIZATION_BLOCK_DETAIL,
-        )
-    canonical_host = f"[{hostname}]" if ":" in hostname else hostname
-    return normalized_nonce, f"http://{canonical_host}:{port}"
 _MODERN_PRIVACY_SETTINGS_URL = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?"
 _RECORDER_PERMISSION_REQUIREMENTS = (
     ("accessibilityTrusted", "Accessibility permission is not granted"),
@@ -235,7 +196,6 @@ def active_native_recording(*, home: Path, profile_name: str) -> Optional[Dict[s
     service_process_state = _reconcile_scoped_recorder_service(
         scope_root=root,
         client=_native_client_path(),
-        remote_reason=_remote_backend_reason(),
         trigger=False,
     )
     return _active_recording_summary(home, profile_name, service_process_state)
@@ -258,7 +218,7 @@ def _active_recording_summary(
         return {
             "recording_dir": str(recording_dir),
             "recording_key": recording_key(home, recording_dir),
-            "name": metadata.get("name") or metadata.get("workflow_id") or recording_dir.parent.name,
+            "name": metadata.get("name") or recording_dir.parent.name,
             "instructions": metadata.get("instructions") or "",
             "status": "recording",
         }
@@ -298,14 +258,18 @@ def start_native_recording(
     instructions: str,
     schedule: str,
     capture_authorization_nonce: str,
-    capture_dashboard_origin: str,
     trigger_requested: bool = False,
     max_duration_seconds: int = 1800,
 ) -> Dict[str, Any]:
-    nonce, dashboard_origin = _validated_capture_authorization(
-        capture_authorization_nonce,
-        capture_dashboard_origin,
-    )
+    nonce = str(capture_authorization_nonce or "").strip().lower()
+    if (
+        len(nonce) != 64
+        or any(character not in "0123456789abcdef" for character in nonce)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=_CAPTURE_AUTHORIZATION_BLOCK_DETAIL,
+        )
     with _claim_chrome_capture_start(home):
         return _start_native_recording(
             home=home,
@@ -315,7 +279,6 @@ def start_native_recording(
             instructions=instructions,
             schedule=schedule,
             capture_authorization_nonce=nonce,
-            capture_dashboard_origin=dashboard_origin,
             trigger_requested=trigger_requested,
             max_duration_seconds=max_duration_seconds,
         )
@@ -330,23 +293,19 @@ def _start_native_recording(
     instructions: str,
     schedule: str,
     capture_authorization_nonce: str,
-    capture_dashboard_origin: str,
     trigger_requested: bool,
     max_duration_seconds: int,
 ) -> Dict[str, Any]:
-    _ensure_local_backend()
     client = _require_native_client()
     recordings = recordings_root(home)
     workflow_root = recordings / workflow_id
-    remote_reason = _remote_backend_reason()
     service_process_repair = _reconcile_scoped_recorder_service(
         scope_root=recordings,
         client=client,
-        remote_reason=remote_reason,
         trigger=True,
     )
     if service_process_repair.get("activeSessions"):
-        raise HTTPException(status_code=409, detail="Another Crunch recording is already active. Stop it before starting a new recording.")
+        raise HTTPException(status_code=409, detail="Another Record recording is already active. Stop it before starting a new recording.")
     global_chrome_recording = active_chrome_recording(home)
     if global_chrome_recording:
         raise HTTPException(
@@ -356,7 +315,7 @@ def _start_native_recording(
     chrome_provider = chrome_provider_preflight()
     chrome_attention = _chrome_provider_needs_attention(chrome_provider)
     log.info(
-        "Crunch recording start requested workflow_id=%s profile=%s chrome_preflight=%s",
+        "Record recording start requested workflow_id=%s profile=%s chrome_preflight=%s",
         workflow_id,
         profile_name,
         chrome_provider.get("status"),
@@ -364,7 +323,9 @@ def _start_native_recording(
     if chrome_attention:
         raise HTTPException(status_code=409, detail=f"{_START_CHROME_PROVIDER_BLOCK_DETAIL} {'; '.join(chrome_attention)}")
     try:
-        permission_state = _request_next_native_recorder_permission(client, root=recordings)
+        # Warm and permission-check the same workflow-scoped service that will
+        # receive `start`; a cold, separate scope can race AppKit capture setup.
+        permission_state = _request_next_native_recorder_permission(client, root=workflow_root)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Native recorder permission request failed: {exc}") from exc
     permission_attention = _recorder_permission_needs_attention(permission_state, require_verified=True)
@@ -372,13 +333,12 @@ def _start_native_recording(
         _open_macos_privacy_settings(
             permission_state,
             client=client,
-            root=recordings,
+            root=workflow_root,
             permission_key=_first_missing_recorder_permission_key(permission_state),
         )
         _reconcile_scoped_recorder_service(
             scope_root=recordings,
             client=client,
-            remote_reason=remote_reason,
             trigger=True,
         )
         raise HTTPException(status_code=409, detail=_start_permission_block_detail(permission_attention))
@@ -398,17 +358,39 @@ def _start_native_recording(
                 _reconcile_scoped_recorder_service(
                     scope_root=recordings,
                     client=client,
-                    remote_reason=remote_reason,
                     trigger=True,
                 )
                 raise HTTPException(status_code=409, detail=_START_PERMISSION_BLOCK_DETAIL) from exc
             raise
         recording_dir = _result_recording_dir(result)
-        log.info("Crunch native recording started workflow_id=%s recording_dir=%s", workflow_id, recording_dir)
+        log.info("Record native recording started workflow_id=%s recording_dir=%s", workflow_id, recording_dir)
+        _patch_session_metadata(
+            recording_dir,
+            {
+                "schemaVersion": RECORDER_SCHEMA,
+                "workflow_id": workflow_id,
+                "name": name.strip(),
+                "instructions": instructions.strip(),
+                "schedule": schedule.strip(),
+                "trigger_requested": bool(trigger_requested),
+                "profile": profile_name,
+                "source": "desktop-plugin",
+                "recorder_version": 3,
+                "review": {"inputs": [], "validations": []},
+                "variable_inputs": [],
+                "validations": [],
+                "input_schema": {"type": "object", "properties": {}},
+                "transport": "native-helper",
+                "native_helper_path": str(client),
+                "service_process_repair": service_process_repair,
+                "capture_providers": ["native", "chrome"],
+                "capture_provider_mode": "adaptive",
+            },
+        )
         native_capture_state = _wait_for_native_capture_ready(recording_dir)
         if not native_capture_state:
             failed_native_state = _read_optional_json(recording_dir / "capture-state.json")
-            log.error("Crunch native input capture did not become ready recording_dir=%s", recording_dir)
+            log.error("Record native input capture did not become ready recording_dir=%s", recording_dir)
             raise HTTPException(
                 status_code=503,
                 detail=_native_live_block_detail(recording_dir, failed_native_state),
@@ -424,7 +406,7 @@ def _start_native_recording(
                 ),
             ) from exc
         log.info(
-            "Crunch native capture stack ready recording_dir=%s health=%s",
+            "Record native capture stack ready recording_dir=%s health=%s",
             recording_dir,
             json.dumps(native_capture_state.get("eventTapHealth", {}), sort_keys=True, default=str),
         )
@@ -437,44 +419,23 @@ def _start_native_recording(
             capture_authorization_sha256=hashlib.sha256(
                 capture_authorization_nonce.encode("ascii")
             ).hexdigest(),
-            capture_dashboard_origin=capture_dashboard_origin,
-        )
-        _patch_session_metadata(
-            recording_dir,
-            {
-                "schemaVersion": RECORDER_SCHEMA,
-                "workflow_id": workflow_id,
-                "name": name.strip(),
-                "instructions": instructions.strip(),
-                "schedule": schedule.strip(),
-                "trigger_requested": bool(trigger_requested),
-                "profile": profile_name,
-                "source": "dashboard",
-                "recorder_version": 3,
-                "review": {"inputs": [], "validations": []},
-                "variable_inputs": [],
-                "validations": [],
-                "input_schema": {"type": "object", "properties": {}},
-                "transport": "native-helper",
-                "native_helper_path": str(client),
-                "service_process_repair": service_process_repair,
-                "capture_providers": ["native", "chrome"],
-                "capture_provider_mode": "adaptive",
-            },
+            capture_authorization=capture_authorization_nonce,
         )
         live_chrome_state = _wait_for_live_chrome_provider(recording_dir)
         if not live_chrome_state:
             failed_chrome_state = _read_optional_json(recording_dir / "capture-state.json")
             log.warning(
-                "Crunch Chrome provider join failed recording_dir=%s state=%s",
+                "Record Chrome provider join failed recording_dir=%s state=%s",
                 recording_dir,
                 json.dumps(failed_chrome_state, sort_keys=True, default=str),
             )
             raise HTTPException(status_code=409, detail=_chrome_live_block_detail(failed_chrome_state))
         log.info(
-            "Crunch Chrome provider joined recording_dir=%s reason=%s tab_id=%s url=%s",
+            "Record Chrome provider ready recording_dir=%s reason=%s desired=%s effective=%s tab_id=%s url=%s",
             recording_dir,
             live_chrome_state.get("reason"),
+            live_chrome_state.get("desiredProvider"),
+            live_chrome_state.get("effectiveProvider"),
             live_chrome_state.get("activeTabId"),
             live_chrome_state.get("activeUrl"),
         )
@@ -509,11 +470,23 @@ def _wait_for_live_chrome_provider(
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while True:
         state = _read_optional_json(recording_dir / "capture-state.json")
-        if not _missing_live_chrome_signals(state):
+        if not _missing_live_chrome_signals(state) or _chrome_provider_is_armed(state):
             return state
         if time.monotonic() >= deadline:
             return {}
         time.sleep(_LIVE_CHROME_JOIN_POLL_SECONDS)
+
+
+def _chrome_provider_is_armed(state: Dict[str, Any]) -> bool:
+    """Accept the authenticated extension handshake before Chrome is frontmost."""
+
+    return (
+        state.get("sessionActive") is True
+        and state.get("desiredProvider") == "native"
+        and state.get("effectiveProvider") == "native"
+        and state.get("chromeSegmentActive") is False
+        and state.get("reason") == "chrome_segment_not_requested"
+    )
 
 
 def _missing_live_chrome_signals(state: Dict[str, Any]) -> List[str]:
@@ -758,7 +731,7 @@ def _abort_unready_recording(*, client: Path, home: Path, recording_dir: Path) -
                 },
             )
         except Exception:
-            log.exception("Crunch could not persist failed-start recovery metadata recording_dir=%s", recording_dir)
+            log.exception("Record could not persist failed-start recovery metadata recording_dir=%s", recording_dir)
     return {
         "shutdownProven": shutdown_proven,
         "nativeStopped": native_stopped,
@@ -831,7 +804,7 @@ def stop_native_recording(
         # a source of continuity diagnostics, not authority to keep a recording
         # open or prevent a best-effort draft.
         log.warning(
-            "Crunch Chrome finalization failed after native stop recording_dir=%s: %s",
+            "Record Chrome finalization failed after native stop recording_dir=%s: %s",
             recording_dir,
             exc,
         )
@@ -867,7 +840,7 @@ def stop_native_recording(
         # The native recorder has already stopped. Derived indexing is useful
         # but reconstructable, so preserve the readable trace and return a
         # stopped recording that the drafter can consume best-effort.
-        log.exception("Crunch evidence assembly degraded recording_dir=%s", recording_dir)
+        log.exception("Record evidence assembly degraded recording_dir=%s", recording_dir)
         capture_verdict = {
             "ready": False,
             "reasons": [{"code": "evidence_assembly_failed", "error_type": type(exc).__name__}],
@@ -875,7 +848,7 @@ def stop_native_recording(
             "media_paths": [],
         }
         evidence_pack = {
-            "schemaVersion": "hermes-crunch-evidence-v1",
+            "schemaVersion": "record-evidence-v1",
             "recording_schema": RECORDER_SCHEMA,
             "session_id": recording_dir.name,
             "workflow_id": recording_dir.parent.name,
@@ -887,7 +860,7 @@ def stop_native_recording(
         try:
             write_json(recording_dir / "evidence-pack.json", evidence_pack)
         except Exception:
-            log.exception("Crunch fallback evidence warning could not be written recording_dir=%s", recording_dir)
+            log.exception("Record fallback evidence warning could not be written recording_dir=%s", recording_dir)
 
     _patch_session_metadata(
         recording_dir,
@@ -896,7 +869,7 @@ def stop_native_recording(
     try:
         seal_capture(recording_dir, evidence_pack=evidence_pack)
     except Exception as exc:
-        log.exception("Crunch capture sealing degraded recording_dir=%s", recording_dir)
+        log.exception("Record capture sealing degraded recording_dir=%s", recording_dir)
         seal_reason = {"code": "capture_seal_failed", "error_type": type(exc).__name__}
         reasons = capture_verdict.get("reasons") if isinstance(capture_verdict.get("reasons"), list) else []
         capture_verdict = {**capture_verdict, "ready": False, "reasons": [*reasons, seal_reason]}
@@ -907,18 +880,76 @@ def stop_native_recording(
                 {"capture_verdict": capture_verdict},
             )
         except Exception:
-            log.exception("Crunch capture seal warning could not be persisted recording_dir=%s", recording_dir)
+            log.exception("Record capture seal warning could not be persisted recording_dir=%s", recording_dir)
     _reconcile_scoped_recorder_service(
         scope_root=recordings_root(home),
         client=client,
-        remote_reason=_remote_backend_reason(),
         trigger=True,
     )
     return {"status": "stopped"}
 
 
+def stop_desktop_recording(
+    *,
+    home: Path,
+    recording_dir: Path,
+    chrome_timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    """Finalize the extension-owned Chrome outbox, then stop native capture."""
+
+    chrome_ok = False
+    chrome_error = ""
+    try:
+        request = request_desktop_chrome_finalize(
+            home=home,
+            recording_dir=recording_dir,
+        )
+        deadline = time.monotonic() + max(1.0, chrome_timeout_seconds)
+        ack: Dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            ack = desktop_chrome_finalize_ack(
+                home=home,
+                recording_dir=recording_dir,
+                request_id=str(request["id"]),
+            )
+            if ack:
+                break
+            time.sleep(0.1)
+        if not ack:
+            chrome_error = (
+                "Chrome provider did not acknowledge Desktop finalization "
+                "before the recording stopped"
+            )
+        else:
+            result = (
+                ack.get("result")
+                if isinstance(ack.get("result"), dict)
+                else {}
+            )
+            chrome_ok = result.get("ok") is True
+            chrome_error = str(result.get("error") or "").strip()
+            if not chrome_ok and not chrome_error:
+                reasons = (
+                    (result.get("continuity") or {}).get("reasons")
+                    if isinstance(result.get("continuity"), dict)
+                    else []
+                )
+                chrome_error = (
+                    "Chrome capture continuity was not verified"
+                    + (f": {', '.join(map(str, reasons))}" if reasons else "")
+                )
+    except Exception as exc:
+        chrome_error = f"{type(exc).__name__}: {exc}"
+    return stop_native_recording(
+        home=home,
+        recording_dir=recording_dir,
+        chrome_finalize_ok=chrome_ok,
+        chrome_finalize_error=chrome_error,
+    )
+
+
 def discard_native_recording(*, home: Path, recording_dir: Path) -> Dict[str, Any]:
-    """End a dashboard recording without destroying its evidence bundle.
+    """End the current Desktop recording without destroying its evidence bundle.
 
     Dismissal is a terminal lifecycle transition, not a filesystem operation.
     Keeping the sealed bundle makes the outcome durable across reloads and gives
@@ -946,57 +977,6 @@ def discard_native_recording(*, home: Path, recording_dir: Path) -> Dict[str, An
         },
     )
     return {"status": "dismissed"}
-
-
-def delete_recording_bundle(*, home: Path, recording_dir: Path) -> Dict[str, Any]:
-    """Permanently delete one explicitly selected, inactive recording bundle."""
-
-    root = _soft_resolve(recordings_root(home))
-    target = _soft_resolve(recording_dir)
-    try:
-        relative = target.relative_to(root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Recording deletion is limited to this profile's Crunch recordings directory.",
-        ) from exc
-    if len(relative.parts) != 2:
-        raise HTTPException(status_code=400, detail="Recording deletion requires one exact recording bundle.")
-    if not target.is_dir():
-        raise HTTPException(status_code=404, detail="Hermes workflow trace recording directory not found.")
-
-    errors: List[str] = []
-    with _claim_chrome_capture_start(home):
-        native_cleanup = _stop_owned_native_recording_for_cleanup(
-            client=_native_client_path(),
-            recording_dir=target,
-        )
-        errors.extend(native_cleanup["errors"])
-        if not _chrome_recording_shutdown_proven(home=home, recording_dir=target):
-            try:
-                deactivate_chrome_capture(home=home, recording_dir=target)
-            except Exception as exc:
-                errors.append(f"chrome_stop:{type(exc).__name__}:{exc}")
-
-        native_stopped = bool(native_cleanup["shutdownProven"])
-        chrome_stopped = _chrome_recording_shutdown_proven(home=home, recording_dir=target)
-        if not native_stopped or not chrome_stopped:
-            detail = (
-                "Hermes refused permanent deletion because recorder shutdown could not be proven "
-                f"(native_stopped={native_stopped}, chrome_stopped={chrome_stopped})."
-            )
-            if errors:
-                detail = f"{detail} {'; '.join(errors)}"
-            raise HTTPException(status_code=409, detail=detail)
-        try:
-            shutil.rmtree(target)
-        except OSError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Hermes could not permanently delete the recording bundle: {type(exc).__name__}: {exc}",
-            ) from exc
-
-    return {"status": "deleted", "recording_key": relative.as_posix()}
 
 
 def recording_status(*, home: Path, recording_dir: Path) -> Dict[str, Any]:
@@ -1044,7 +1024,6 @@ def _cleanup_stopped_recording(*, home: Path, recording_dir: Path) -> None:
     _reconcile_scoped_recorder_service(
         scope_root=recordings_root(home),
         client=_native_client_path(),
-        remote_reason=_remote_backend_reason(),
         trigger=True,
     )
 
@@ -1081,24 +1060,10 @@ def _require_native_client() -> Path:
     return client
 
 
-def _ensure_local_backend() -> None:
-    reason = _remote_backend_reason()
-    if reason:
-        raise HTTPException(status_code=409, detail=reason)
-
-
-def _remote_backend_reason() -> Optional[str]:
-    remote_url = os.environ.get("HERMES_DESKTOP_REMOTE_URL", "").strip()
-    if remote_url:
-        return "Native recording is local-only and is disabled while Hermes Desktop is connected to a remote backend."
-    return None
-
-
 def _reconcile_scoped_recorder_service(
     *,
     scope_root: Path,
     client: Optional[Path],
-    remote_reason: Optional[str],
     trigger: bool,
 ) -> Dict[str, Any]:
     """Restart only stale idle recorder services in the current recording scope."""
@@ -1115,9 +1080,6 @@ def _reconcile_scoped_recorder_service(
     }
     if os.sys.platform != "darwin":
         base["reason"] = "not_macos"
-        return base
-    if remote_reason:
-        base["reason"] = "remote_backend"
         return base
     if client is None:
         base["reason"] = "helper_missing"
@@ -1322,7 +1284,13 @@ def _native_client_path() -> Optional[Path]:
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    overlay_path = os.environ.get("HERMES_CRUNCH_NATIVE_ROOT", "").strip()
+    candidates.append(
+        get_default_hermes_root().expanduser().resolve()
+        / "record"
+        / "native-recorder"
+        / "hermes-recorder"
+    )
+    overlay_path = os.environ.get("HERMES_RECORD_NATIVE_ROOT", "").strip()
     overlay_roots = (
         [Path(overlay_path).expanduser()]
         if overlay_path
@@ -1404,10 +1372,17 @@ def _result_recording_dir(result: Dict[str, Any]) -> Path:
 
 
 def _patch_session_metadata(recording_dir: Path, values: Dict[str, Any]) -> None:
-    for name in ("metadata.json", "session.json"):
-        path = recording_dir / name
-        data = read_json(path)
-        data.update(values)
-        if name == "session.json":
-            data["status"] = data.get("state") or data.get("status") or "recording"
-        write_json(path, data)
+    lock_path = recording_dir / "trace.jsonl.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_fh:
+        fcntl.lockf(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            for name in ("metadata.json", "session.json"):
+                path = recording_dir / name
+                data = read_json(path)
+                data.update(values)
+                if name == "session.json":
+                    data["status"] = data.get("state") or data.get("status") or "recording"
+                write_json(path, data)
+        finally:
+            fcntl.lockf(lock_fh.fileno(), fcntl.LOCK_UN)

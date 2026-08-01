@@ -6,10 +6,6 @@
   const lifecycleController = new AbortController();
   const captureListenerOptions = { capture: true, signal: lifecycleController.signal };
   const CONTENT_SCRIPT_VERSION = 4;
-  const DASHBOARD_SOURCE = "hermes-crunch-dashboard";
-  const PROVIDER_SOURCE = "hermes-chrome-provider";
-  const PROVIDER_REQUEST_TYPE = "hcc-provider-request";
-  const PROVIDER_RESPONSE_TYPE = "hcc-provider-response";
   const INTERACTIVE_SELECTOR = [
     "a[href]", "button", "input", "textarea", "select", "option", "summary", "label",
     "[role]", "[contenteditable]", "[draggable='true']", "[data-testid]", "[aria-label]",
@@ -108,38 +104,6 @@
     }
     return undefined;
   });
-
-  window.addEventListener("message", (event) => {
-    const request = event.data;
-    if (event.source !== window) return;
-    if (!request || request.source !== DASHBOARD_SOURCE || request.type !== PROVIDER_REQUEST_TYPE) return;
-    if (!request.requestId || !["probe", "prepare", "cancel", "finalize"].includes(request.command)) return;
-    if (event.origin !== window.location.origin) return;
-
-    const postResponse = (response, runtimeError = null) => {
-      window.postMessage({
-        source: PROVIDER_SOURCE,
-        type: PROVIDER_RESPONSE_TYPE,
-        requestId: request.requestId,
-        ok: !runtimeError && response?.ok === true,
-        contentScriptVersion: response?.contentScriptVersion,
-        error: runtimeError?.message || response?.error || "",
-      }, window.location.origin);
-    };
-    try {
-      extensionRuntime.sendMessage({
-        type: "hcc-provider-command",
-        command: request.command,
-        requestId: request.requestId,
-        recordingId: request.recordingId || "",
-        captureAuthorization: request.captureAuthorization || "",
-      }, (response) => {
-        postResponse(response, extensionRuntime.lastError);
-      });
-    } catch (error) {
-      postResponse(null, error);
-    }
-  }, { signal: lifecycleController.signal });
 
   refreshCaptureAuthority();
 

@@ -14,12 +14,12 @@ function paint(status) {
   stateLabel.textContent = chromeSegmentActive
     ? `Chrome segment active: ${status.activeTarget?.title || status.activeTarget?.url || "active tab"}`
     : nativeActive
-      ? "Crunch recording ready"
-      : "No active Crunch recording";
+      ? "Record recording ready"
+      : "No active Record recording";
   shot.disabled = !chromeSegmentActive;
   hint.textContent = nativeActive
-    ? "Only the active Chrome tab and its frames are written into the active local Crunch bundle."
-    : "Start a Crunch recording first, then use Chrome to activate the Chrome segment.";
+    ? "Only the active Chrome tab and its frames are written into the active local Record bundle."
+    : "Start a Record recording first, then use Chrome to activate the Chrome segment.";
   hint.className = "hint";
 }
 

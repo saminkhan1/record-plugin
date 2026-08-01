@@ -1,0 +1,9 @@
+{
+  "name": "@record/desktop-plugin",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "check": "node --check ./plugin.js && node ./scripts/build.mjs"
+  }
+}

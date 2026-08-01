@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="280" viewBox="0 0 440 280">
+  <rect width="440" height="280" fill="#f7f6f1"/>
+  <rect x="12" y="12" width="416" height="256" rx="24" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <circle cx="117" cy="140" r="82" fill="#f2c94c"/>
+  <image href="../../assets/icon.png" x="48" y="71" width="138" height="138"/>
+
+  <rect x="226" y="62" width="72" height="25" rx="12.5" fill="#f2c94c"/>
+  <text
+    x="262"
+    y="79"
+    fill="#111111"
+    font-family="Arial"
+    font-size="12"
+    font-weight="800"
+    letter-spacing="1.3"
+    text-anchor="middle"
+  >BETA</text>
+
+  <text
+    x="226"
+    y="124"
+    fill="#111111"
+    font-family="Arial"
+    font-size="34"
+    font-weight="800"
+  >Hermes</text>
+  <text
+    x="226"
+    y="157"
+    fill="#111111"
+    font-family="Arial"
+    font-size="23"
+    font-weight="650"
+  >Chrome Provider</text>
+  <line x1="226" y1="181" x2="382" y2="181" stroke="#111111" stroke-width="2"/>
+  <text
+    x="226"
+    y="209"
+    fill="#303030"
+    font-family="Arial"
+    font-size="15"
+    font-weight="600"
+    letter-spacing="0.2"
+  >Record • Draft • Approve</text>
+</svg>

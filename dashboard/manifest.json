@@ -1,14 +1,14 @@
 {
-  "name": "hermes-crunch",
+  "name": "record",
   "label": "Workflows",
-  "description": "Record, review, schedule, and support Hermes Crunch workflows",
+  "description": "Backend routes for the Record Desktop workflow recorder",
   "icon": "Workflow",
   "version": "0.1.0",
   "tab": {
     "path": "/workflows",
-    "position": "after:cron"
+    "position": "after:cron",
+    "hidden": true
   },
   "entry": "dist/index.js",
-  "css": "dist/style.css",
   "api": "plugin_api.py"
 }

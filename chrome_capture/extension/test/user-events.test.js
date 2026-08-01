@@ -146,92 +146,6 @@ function loadUserEvents() {
   };
 }
 
-test("dashboard bridge forwards capture authorization only through the explicit provider command", async () => {
-  const harness = loadUserEvents();
-  const { window } = harness;
-  const captureAuthorization = "cd".repeat(32);
-  await sleep(0);
-
-  window.dispatchEvent(new window.MessageEvent("message", {
-    source: window,
-    origin: window.location.origin,
-    data: {
-      source: "hermes-crunch-dashboard",
-      type: "hcc-provider-request",
-      requestId: "prepare-1",
-      command: "prepare",
-      captureAuthorization,
-    },
-  }));
-  await sleep(0);
-
-  const command = harness.sentMessages.find((message) =>
-    message.type === "hcc-provider-command" && message.requestId === "prepare-1"
-  );
-  assert.ok(command);
-  assert.equal(command.captureAuthorization, captureAuthorization);
-  assert.equal(Object.hasOwn(command, "url"), false);
-  assert.equal(Object.hasOwn(command, "title"), false);
-  harness.close();
-});
-
-test("dashboard bridge fails cleanly when its extension context is invalidated", async () => {
-  const harness = loadUserEvents();
-  const { window } = harness;
-  await sleep(0);
-  const responses = [];
-  window.addEventListener("message", (event) => {
-    if (event.data?.source === "hermes-chrome-provider") responses.push(event.data);
-  });
-  harness.invalidateRuntime();
-
-  window.dispatchEvent(new window.MessageEvent("message", {
-    source: window,
-    origin: window.location.origin,
-    data: {
-      source: "hermes-crunch-dashboard",
-      type: "hcc-provider-request",
-      requestId: "invalidated-1",
-      command: "prepare",
-      captureAuthorization: "cd".repeat(32),
-    },
-  }));
-  await sleep(0);
-
-  assert.equal(responses.length, 1);
-  assert.equal(responses[0].ok, false);
-  assert.match(responses[0].error, /context invalidated/i);
-  harness.close();
-});
-
-test("reinjection replaces a stale extension context without reloading the page", async () => {
-  const harness = loadUserEvents();
-  const { window } = harness;
-  await sleep(0);
-  harness.reinjectCurrentContext();
-  harness.reloadExtensionContext();
-  await sleep(0);
-
-  window.dispatchEvent(new window.MessageEvent("message", {
-    source: window,
-    origin: window.location.origin,
-    data: {
-      source: "hermes-crunch-dashboard",
-      type: "hcc-provider-request",
-      requestId: "reloaded-1",
-      command: "prepare",
-      captureAuthorization: "cd".repeat(32),
-    },
-  }));
-  await sleep(0);
-
-  const commands = harness.sentMessages.filter((message) =>
-    message.type === "hcc-provider-command" && message.requestId === "reloaded-1"
-  );
-  assert.equal(commands.length, 1);
-  harness.close();
-});
-
 test("inactive content script does not read or emit page data", async () => {
   const harness = loadUserEvents();
   const { window } = harness;
@@ -323,6 +237,73 @@ test("inactive content script does not read or emit page data", async () => {
   assert.equal(ping.ready, true);
   assert.equal(ping.version, 4);
   assert.equal(Object.hasOwn(ping, "url"), false);
+
+  harness.close();
+});
+
+test("active capture records customer inputs and file metadata while redacting passwords", async () => {
+  const harness = loadUserEvents();
+  const { window } = harness;
+  await sleep(0);
+  harness.updateAuthority(true, 1);
+
+  const textInput = window.document.createElement("input");
+  textInput.type = "text";
+  textInput.value = "customer reference 42";
+  const passwordInput = window.document.createElement("input");
+  passwordInput.type = "password";
+  passwordInput.value = "never-record-this-secret";
+  const fileInput = window.document.createElement("input");
+  fileInput.type = "file";
+  Object.defineProperty(fileInput, "files", {
+    configurable: true,
+    value: [{
+      name: "customer-report.pdf",
+      size: 2048,
+      type: "application/pdf",
+      lastModified: 1234,
+    }],
+  });
+  window.document.body.append(textInput, passwordInput, fileInput);
+
+  textInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+  passwordInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+  fileInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+  const passwordPaste = new window.Event("paste", { bubbles: true });
+  Object.defineProperty(passwordPaste, "clipboardData", {
+    value: { getData: () => "never-record-this-pasted-secret" },
+  });
+  passwordInput.dispatchEvent(passwordPaste);
+  await sleep(400);
+
+  const actions = harness.sentMessages.filter(
+    (message) => message.type === "hcc-trace-action",
+  );
+  const typed = actions.find(
+    (message) => message.event.kind === "type"
+      && message.event.payload.input.value === "customer reference 42",
+  );
+  const redacted = actions.filter(
+    (message) => ["type", "paste"].includes(message.event.kind)
+      && message.event.payload.input.secure_input === true,
+  );
+  const upload = actions.find((message) => message.event.kind === "upload");
+
+  assert.ok(typed);
+  assert.equal(redacted.length, 2);
+  assert.ok(redacted.every(
+    (message) => message.event.payload.input.redacted === true,
+  ));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(upload.event.payload.input.files)),
+    [{
+      name: "customer-report.pdf",
+      size: 2048,
+      mime: "application/pdf",
+      last_modified: 1234,
+    }],
+  );
+  assert.doesNotMatch(JSON.stringify(actions), /never-record-this/);
 
   harness.close();
 });

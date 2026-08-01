@@ -2,25 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sys
 from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
-
-from hermes_crunch import approval, compiler, evidence, recording
-import chrome_capture
-import hermes_recorder
-from hermes_recorder import discard_native_recording
-from hermes_crunch.trace_schema import (
+from hermes_plugins.record.record import (
+    compiler,
+    evidence,
+    hermes,
+    recording,
+)
+from hermes_plugins.record import chrome_capture, hermes_recorder
+from hermes_plugins.record.hermes_recorder import discard_native_recording
+from hermes_plugins.record.record.trace_schema import (
     LEGACY_SCHEMA_VERSION,
     SCHEMA_VERSION,
     http_url_origin,
-    is_recorder_dashboard_url,
     normalize_trace_row,
     url_origin,
 )
@@ -36,38 +34,6 @@ def _row(row_id: int, *, source: str, kind: str, payload: dict) -> dict:
         "payload": payload,
         "quality": {"confidence": "high", "warnings": []},
     }
-
-
-def test_recorder_control_detection_uses_loopback_workflows_path_not_fixed_port():
-    dashboard = {
-        "surface": "browser",
-        "browser": {
-            "origin": "http://127.0.0.1:54821",
-            "url": "http://127.0.0.1:54821/workflows/review?profile=default#capture",
-        },
-        "target": {"label": "Stop and draft"},
-    }
-    local_business_app = {
-        "surface": "browser",
-        "browser": {
-            "origin": "http://localhost:3000",
-            "url": "http://localhost:3000/operations/workflows",
-        },
-        "target": {"label": "Stop server"},
-    }
-
-    assert recording._is_recorder_control_event(dashboard) is True
-    assert recording._is_recorder_control_event(local_business_app) is False
-    assert is_recorder_dashboard_url(dashboard["browser"]["url"]) is True
-    assert is_recorder_dashboard_url(local_business_app["browser"]["url"]) is False
-    assert evidence.trace_row_is_recorder_control({
-        "type": "action",
-        "payload": {"browser": {"url": dashboard["browser"]["url"]}}
-    }) is True
-    assert evidence.trace_row_is_recorder_control({
-        "type": "action",
-        "payload": {"browser": {"url": local_business_app["browser"]["url"]}}
-    }) is False
 
 
 def test_chrome_segment_start_waits_for_backend_recording(monkeypatch):
@@ -87,8 +53,93 @@ def test_chrome_segment_start_waits_for_backend_recording(monkeypatch):
     }
 
 
+def test_desktop_chrome_authority_and_finalize_ack_round_trip(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "profiles" / "customer"
+    recording_dir = (
+        home
+        / "record"
+        / "recordings"
+        / "customer-workflow"
+        / "recording-1"
+    )
+    recording_dir.mkdir(parents=True)
+    for name, value in (
+        (
+            "metadata.json",
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": True,
+                "state": "recording",
+                "sessionID": "recording-1",
+            },
+        ),
+        (
+            "session.json",
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": True,
+                "status": "recording",
+                "sessionID": "recording-1",
+            },
+        ),
+    ):
+        (recording_dir / name).write_text(
+            json.dumps(value),
+            encoding="utf-8",
+        )
+    (recording_dir / "trace.jsonl").write_text("", encoding="utf-8")
+
+    authorization = "ab" * 32
+    chrome_capture.activate_chrome_capture(
+        home=home,
+        profile_name="customer",
+        recording_dir=recording_dir,
+        workflow_id="customer-workflow",
+        title="Customer workflow",
+        capture_authorization_sha256=hashlib.sha256(
+            authorization.encode("ascii"),
+        ).hexdigest(),
+        capture_authorization=authorization,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    host = chrome_capture.ChromeNativeHost()
+    status = host.handle_message({"id": 1, "type": "status"})
+    desktop = status["desktopCaptureAuthority"]
+    assert status["ok"] is True
+    assert status["protocolVersion"] == chrome_capture.CHROME_PROTOCOL_VERSION
+    assert desktop["active"] is True
+    assert desktop["recordingId"] == "recording-1"
+    assert desktop["captureAuthorization"] == authorization
+
+    request = chrome_capture.request_desktop_chrome_finalize(
+        home=home,
+        recording_dir=recording_dir,
+    )
+    ack = host.handle_message(
+        {
+            "id": 2,
+            "type": "desktop.finalize.ack",
+            "protocolVersion": chrome_capture.CHROME_PROTOCOL_VERSION,
+            "recordingId": "recording-1",
+            "requestId": request["id"],
+            "result": {"ok": True, "continuity": {"ok": True, "reasons": []}},
+        }
+    )
+    assert ack["ok"] is True
+    persisted = chrome_capture.desktop_chrome_finalize_ack(
+        home=home,
+        recording_dir=recording_dir,
+        request_id=request["id"],
+    )
+    assert persisted["result"]["continuity"]["ok"] is True
+
+
 def test_dismissal_is_a_durable_terminal_state_not_a_recursive_delete(tmp_path, monkeypatch):
-    recording_dir = tmp_path / "crunch" / "recordings" / "example" / "rec-1"
+    recording_dir = tmp_path / "record" / "recordings" / "example" / "rec-1"
     recording_dir.mkdir(parents=True)
     for name, value in (
         ("metadata.json", {"state": "stopped", "status": "stopped"}),
@@ -110,7 +161,7 @@ def test_dismissal_is_a_durable_terminal_state_not_a_recursive_delete(tmp_path, 
 
 
 def test_scheduled_recording_cannot_be_discarded(tmp_path):
-    recording_dir = tmp_path / "crunch" / "recordings" / "example" / "rec-1"
+    recording_dir = tmp_path / "record" / "recordings" / "example" / "rec-1"
     recording_dir.mkdir(parents=True)
     for name in ("metadata.json", "session.json"):
         (recording_dir / name).write_text(
@@ -590,7 +641,7 @@ def _write_recording(
     rows: list[dict],
     schema_version: str = LEGACY_SCHEMA_VERSION,
 ) -> Path:
-    root = tmp_path / "home" / "crunch" / "recordings" / "customer-workflow" / "rec-1"
+    root = tmp_path / "home" / "record" / "recordings" / "customer-workflow" / "rec-1"
     root.mkdir(parents=True)
     metadata = {
         "schemaVersion": schema_version,
@@ -651,11 +702,6 @@ def _draft_plan() -> dict:
         "state_strategy": "not_required",
         "idempotency_strategy": "Check the inbox before changing it.",
         "steps": ["Archive the demonstrated customer message and verify it is no longer in the inbox."],
-        "approval_steps": [{
-            "step": 1,
-            "operation_id": "archive-reviewed-message",
-            "effect": "update",
-        }],
         "execution": {
             "no_agent": False,
             "script": None,
@@ -668,24 +714,49 @@ def _draft_plan() -> dict:
                 "apps": ["Google Chrome"],
                 "files": [],
             },
-            "authorization": {
-                "mode": "human_in_loop",
-                "effects": [],
-                "operations": [{
-                    "id": "archive-reviewed-message",
-                    "effect": "update",
-                    "description": "Archive the demonstrated customer message.",
-                    "tool": "browser",
-                    "arguments": {
-                        "field": "action",
-                        "equals": "archive",
-                    },
-                }],
-                "checkpoints": [],
-            },
+        },
+        "trigger": {
+            "requested": False,
+            "feasibility": "not_requested",
+            "description": "",
+            "source": None,
+            "events": [],
+            "filters": None,
+            "reason": "No event trigger was requested.",
         },
         "warnings": [],
     }
+
+
+def test_selected_profile_keeps_its_full_cron_tool_configuration(tmp_path):
+    plan = _draft_plan()
+    plan["execution"]["enabled_toolsets"] = []
+
+    normalized = compiler.validate_draft_plan(plan)
+    workflow = {
+        **normalized,
+        "id": "profile-owned-tools",
+        "name": "Profile-owned tools",
+        "schedule": "0 9 * * *",
+    }
+    compiled = compiler.compile_workflow(
+        workflow,
+        tmp_path / "profile",
+        tmp_path / "build",
+    )
+
+    assert compiled.payload["enabled_toolsets"] is None
+    assert "enabled_toolsets" not in hermes._cron_tool_arguments(
+        "create",
+        compiled.payload,
+    )
+
+    plan["execution"]["enabled_toolsets"] = ["browser"]
+    with pytest.raises(
+        compiler.CompileError,
+        match="selected Hermes profile owns Cron tool configuration",
+    ):
+        compiler.validate_draft_plan(plan)
 
 
 def test_drafting_surfaces_warning_when_required_chrome_actions_were_not_captured(tmp_path):
@@ -828,7 +899,7 @@ def test_authoring_failure_propagates_without_fabricating_a_workflow(tmp_path):
     assert not (recording_dir / "workflow.json").exists()
 
 
-def test_agent_authored_steps_and_approval_rows_reach_the_review_unchanged(tmp_path):
+def test_agent_authored_steps_reach_the_review_unchanged(tmp_path):
     recording_dir = _write_recording(
         tmp_path,
         instructions=(
@@ -841,24 +912,6 @@ def test_agent_authored_steps_and_approval_rows_reach_the_review_unchanged(tmp_p
         "Get the latest video from the Weng Techno YouTube channel.",
         "Add the video URL to Reminders to listen to later.",
     ]
-    authored["approval_steps"] = [{
-        "step": 2,
-        "operation_id": "create-listen-later-reminder",
-        "effect": "create",
-    }]
-    authored["execution"]["authorization"] = {
-        "mode": "human_in_loop",
-        "effects": [],
-        "operations": [{
-            "id": "create-listen-later-reminder",
-            "effect": "create",
-            "description": "Add the video URL to Reminders.",
-            "tool": "browser",
-            "arguments": {"field": "action", "equals": "create"},
-        }],
-        "checkpoints": [],
-    }
-
     workflow = recording.build_draft_candidate(
         recording_dir,
         output=recording_dir / "workflow.json",
@@ -868,8 +921,6 @@ def test_agent_authored_steps_and_approval_rows_reach_the_review_unchanged(tmp_p
     ).workflow
 
     assert workflow["review"]["execution_steps"] == authored["steps"]
-    assert workflow["review"]["approval_steps"] == authored["approval_steps"]
-    assert workflow["execution"]["authorization"] == authored["execution"]["authorization"]
 
 
 
