@@ -3,6 +3,8 @@ import {
   Button,
   ConfirmDialog,
   CopyButton,
+  CronScheduleField,
+  CronScheduleSummary,
   Input,
   Loader,
   PALETTE_AREA,
@@ -26,6 +28,7 @@ const ROUTE = '/workflows'
 const POLL_MS = 5_000
 const ACTIVE_POLL_MS = 3_000
 const DRAFT_POLL_MS = 3_000
+const DEFAULT_SCHEDULE = '0 9 * * 1-5'
 const REVIEW_STATES = new Set([
   'needs_input',
   'needs_rerecord',
@@ -75,37 +78,6 @@ function recordingKey(recording) {
   return String(recording?.recording_key || recording?.recording_dir || '')
 }
 
-function reviewedPrompt(draft) {
-  const workflow = draft?.workflow
-  const execution = workflow && typeof workflow.execution === 'object' ? workflow.execution : {}
-
-  return typeof execution.prompt === 'string' ? execution.prompt.trim() : ''
-}
-
-function reviewedScript(draft, review) {
-  const supplied = review?.script_review
-
-  if (supplied && typeof supplied === 'object' && typeof supplied.source === 'string') {
-    return {
-      path: String(supplied.path || ''),
-      source: supplied.source,
-      sha256: String(supplied.sha256 || '')
-    }
-  }
-
-  const script = draft?.workflow?.execution?.script
-
-  if (!script || typeof script !== 'object' || typeof script.body !== 'string') {
-    return null
-  }
-
-  return {
-    path: String(script.path || ''),
-    source: script.body.endsWith('\n') ? script.body : `${script.body}\n`,
-    sha256: ''
-  }
-}
-
 function reviewSteps(draft) {
   const review = draft?.workflow?.review
 
@@ -145,22 +117,6 @@ function reviewMessages(review) {
       key: `${thread?.thread_id || threadIndex}:${messageIndex}`
     }))
   })
-}
-
-function securityPolicyCopy(t, policy) {
-  const mode = String(policy?.mode || '').trim().toLowerCase()
-  const cronMode = String(policy?.cronMode || '').trim().toLowerCase()
-
-  if (mode === 'off') {
-    return t('review.securityOff')
-  }
-  if (cronMode === 'deny') {
-    return t('review.securityCronDeny', mode || 'profile default')
-  }
-  if (cronMode === 'approve') {
-    return t('review.securityCronApprove', mode || 'profile default')
-  }
-  return t('review.securityUnknown', mode || 'profile default')
 }
 
 function webhookTrigger(draft) {
@@ -454,49 +410,6 @@ function Notice({ children, kind = 'info', live = false }) {
   )
 }
 
-function CronScheduleField({ disabled, error, inputRef, onChange, value }) {
-  const t = usePluginI18n(ID)
-
-  return element(
-    Field,
-    {
-      error,
-      errorId: 'new-workflow-schedule-error',
-      hint: t('new.scheduleHint'),
-      hintId: 'new-workflow-schedule-hint',
-      label: t('new.schedule')
-    },
-    element(Input, {
-      'aria-describedby': [
-        'new-workflow-schedule-hint',
-        error ? 'new-workflow-schedule-error' : null
-      ]
-        .filter(Boolean)
-        .join(' '),
-      'aria-invalid': error ? 'true' : undefined,
-      disabled: Boolean(disabled),
-      id: 'new-workflow-schedule',
-      onChange,
-      placeholder: t('new.schedulePlaceholder'),
-      ref: inputRef,
-      value
-    })
-  )
-}
-
-function CronScheduleSummary({ value }) {
-  const t = usePluginI18n(ID)
-
-  return element('div', { className: 'flex flex-col gap-1 rounded-[4px] bg-(--ui-bg-tertiary) px-3 py-2' }, [
-    element(
-      'code',
-      { className: 'select-text break-all font-mono text-xs text-(--ui-text-primary)', key: 'value' },
-      value || t('review.scheduleMissing')
-    ),
-    element('span', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', key: 'hint' }, t('review.scheduleSummary'))
-  ])
-}
-
 function WorkflowForm({ form, setForm, busy, onStart }) {
   const t = usePluginI18n(ID)
   const [errors, setErrors] = useState({})
@@ -626,14 +539,18 @@ function WorkflowForm({ form, setForm, busy, onStart }) {
         }),
         form.runMode === 'schedule'
           ? element(CronScheduleField, {
+              controlRef: scheduleRef,
+              description: t('new.scheduleHint'),
               disabled: Boolean(busy),
               error: errors.schedule,
-              inputRef: scheduleRef,
+              idPrefix: 'new-workflow',
               key: 'schedule',
-              onChange: event => {
+              label: t('new.schedule'),
+              onChange: schedule => {
                 clearError('schedule')
-                setForm(current => ({ ...current, schedule: event.target.value }))
+                setForm(current => ({ ...current, schedule }))
               },
+              routineOnly: true,
               value: form.schedule
             })
           : element(
@@ -832,7 +749,6 @@ function ReviewConversation({
 function WorkflowReview({
   draft,
   review,
-  securityPolicy,
   runMode,
   schedule,
   webhookStatus,
@@ -846,8 +762,8 @@ function WorkflowReview({
   const t = usePluginI18n(ID)
   const steps = reviewSteps(draft)
   const blockers = reviewBlockers(draft, review)
-  const prompt = reviewedPrompt(draft)
-  const script = reviewedScript(draft, review)
+  const messages = reviewMessages(review)
+  const canRedraft = review?.state === 'ready_to_redraft' && review?.thread_id
   const trigger = webhookTrigger(draft)
   const webhookReady =
     runMode !== 'webhook' ||
@@ -870,7 +786,7 @@ function WorkflowReview({
           : reviewStateText(t, review?.state) || t('review.checking')
       )
     },
-    element('div', { className: 'grid gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(18rem,0.9fr)]' }, [
+    element('div', { className: 'flex flex-col gap-5' }, [
       element('div', { className: 'flex min-w-0 flex-col gap-4', key: 'plan' }, [
         element('div', { key: 'summary' }, [
           element(
@@ -918,93 +834,6 @@ function WorkflowReview({
               )
             ])
           : null,
-        element(Notice, { key: 'security' }, [
-          element(
-            'strong',
-            { className: 'font-medium', key: 'title' },
-            t('review.securityTitle')
-          ),
-          element('p', { className: 'mt-1', key: 'install' }, t('review.securityInstall')),
-          element(
-            'p',
-            { className: 'mt-1', key: 'runtime' },
-            securityPolicyCopy(t, securityPolicy)
-          )
-        ]),
-        prompt
-          ? element('details', { className: 'group', key: 'prompt' }, [
-              element(
-                'summary',
-                {
-                  className:
-                    'cursor-pointer text-xs font-medium text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)',
-                  key: 'summary'
-                },
-                t('review.prompt')
-              ),
-              element(
-                'pre',
-                {
-                  className:
-                    'select-text mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-[4px] border border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) p-3 font-mono text-[0.6875rem] leading-5 text-(--ui-text-tertiary)',
-                  key: 'body'
-                },
-                prompt
-              )
-            ])
-          : null,
-        script
-          ? element('details', { className: 'group', key: 'script' }, [
-              element(
-                'summary',
-                {
-                  className:
-                    'cursor-pointer text-xs font-medium text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)',
-                  key: 'summary'
-                },
-                t('review.script')
-              ),
-              element('div', { className: 'mt-2 flex flex-col gap-2', key: 'content' }, [
-                script.path
-                  ? element(
-                      'code',
-                      {
-                        className:
-                          'select-text break-all text-[0.6875rem] text-(--ui-text-tertiary)',
-                        key: 'path'
-                      },
-                      script.path
-                    )
-                  : null,
-                script.sha256
-                  ? element('div', { className: 'text-[0.6875rem]', key: 'sha256' }, [
-                      element(
-                        'span',
-                        { className: 'text-(--ui-text-tertiary)', key: 'label' },
-                        `${t('review.scriptHash')}: `
-                      ),
-                      element(
-                        'code',
-                        {
-                          className: 'select-text break-all text-(--ui-text-tertiary)',
-                          key: 'value'
-                        },
-                        script.sha256
-                      )
-                    ])
-                  : null,
-                element(
-                  'pre',
-                  {
-                    className:
-                      'select-text max-h-80 overflow-auto whitespace-pre-wrap rounded-[4px] border border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) p-3 font-mono text-[0.6875rem] leading-5 text-(--ui-text-tertiary)',
-                    key: 'source'
-                  },
-                  script.source
-                )
-              ])
-            ])
-          : null,
         element('div', { className: 'grid gap-1.5', key: 'starts' }, [
           element(
             'div',
@@ -1033,21 +862,29 @@ function WorkflowReview({
           )
         ])
       ]),
-      element('aside', { className: 'min-w-0', key: 'conversation' }, [
+      element('details', { className: 'group', key: 'conversation', open: Boolean(messages.length || canRedraft) }, [
         element(
-          'h3',
-          { className: 'mb-2 text-xs font-medium text-(--ui-text-secondary)', key: 'title' },
-          t('review.withHermes')
+          'summary',
+          {
+            className:
+              'cursor-pointer text-xs font-medium text-(--ui-text-secondary) hover:text-(--ui-text-primary)',
+            key: 'summary'
+          },
+          t('review.conversation')
         ),
-        element(ReviewConversation, {
-          busy,
-          key: 'conversation',
-          message,
-          onRedraft,
-          onSend: onSendReview,
-          review,
-          setMessage
-        })
+        element(
+          'div',
+          { className: 'mt-3 max-w-2xl', key: 'content' },
+          element(ReviewConversation, {
+            busy,
+            key: 'conversation',
+            message,
+            onRedraft,
+            onSend: onSendReview,
+            review,
+            setMessage
+          })
+        )
       ])
     ])
   )
@@ -1191,7 +1028,7 @@ function RecordProfilePage({ client, profile }) {
   const [form, setForm] = useState({
     name: '',
     instructions: '',
-    schedule: '',
+    schedule: DEFAULT_SCHEDULE,
     runMode: 'schedule'
   })
   const [busy, setBusy] = useState('')
@@ -1238,21 +1075,6 @@ function RecordProfilePage({ client, profile }) {
     queryKey: reviewKey,
     queryFn: () => client.loadReview(profile, key, digest),
     refetchInterval: false,
-    retry: false
-  })
-
-  const securityPolicyQuery = useQuery({
-    enabled: Boolean(draft),
-    queryKey: [client.scope, 'hermes-security-policy-full', profile],
-    queryFn: async () => {
-      const result = await host.request('config.get', { key: 'full' })
-      const approvals = result?.config?.approvals
-
-      return {
-        mode: String(approvals?.mode ?? '').trim(),
-        cronMode: String(approvals?.cron_mode ?? '').trim()
-      }
-    },
     retry: false
   })
 
@@ -1431,7 +1253,7 @@ function RecordProfilePage({ client, profile }) {
       await client.discardRecording(profile, key)
       setRecording(null)
       setDraft(null)
-      setForm({ name: '', instructions: '', schedule: '', runMode: 'schedule' })
+      setForm({ name: '', instructions: '', schedule: DEFAULT_SCHEDULE, runMode: 'schedule' })
       setReviewMessage('')
       await refreshActiveRecording()
     } catch (error) {
@@ -1497,7 +1319,7 @@ function RecordProfilePage({ client, profile }) {
   function newWorkflow() {
     setInstalled(null)
     setNotice('')
-    setForm({ name: '', instructions: '', schedule: '', runMode: 'schedule' })
+    setForm({ name: '', instructions: '', schedule: DEFAULT_SCHEDULE, runMode: 'schedule' })
     setRecording(null)
     setDraft(null)
     setReviewMessage('')
@@ -1516,7 +1338,6 @@ function RecordProfilePage({ client, profile }) {
           review: reviewQuery.data,
           runMode: form.runMode,
           schedule: form.schedule,
-          securityPolicy: securityPolicyQuery.data,
           setMessage: setReviewMessage,
           webhookStatus
         })
@@ -1556,17 +1377,7 @@ function RecordProfilePage({ client, profile }) {
             { className: 'truncate text-xs text-(--ui-text-tertiary)', key: 'description' },
             t('page.description')
           )
-        ]),
-        element(
-          Badge,
-          {
-            'aria-label': t('page.profileLabel', profile),
-            key: 'profile',
-            title: t('page.profileLabel', profile),
-            variant: 'outline'
-          },
-          t('page.profileLabel', profile)
-        )
+        ])
       ]
     ),
     element(
@@ -1667,7 +1478,6 @@ export default {
           title: 'Workflows',
           description:
             'Describe the result and how it starts, then show Hermes the work once.',
-          profileLabel: profile => `Selected Hermes profile: ${profile}`,
           loading: 'Loading workflows'
         },
         status: {
@@ -1685,9 +1495,8 @@ export default {
           instructions: 'What should Hermes reproduce?',
           instructionsHint: 'State the intended result and any limits Hermes must keep.',
           instructionsPlaceholder: 'Open the vendor portal, collect the latest status, and prepare the same brief…',
-          schedule: 'Cron schedule',
-          scheduleHint: 'Use standard five-field Cron syntax, for example 0 9 * * 1-5.',
-          schedulePlaceholder: '0 9 * * 1-5',
+          schedule: 'Schedule',
+          scheduleHint: 'Choose when Hermes should run this workflow.',
           start: 'Start recording',
           starting: 'Preparing recorder…'
         },
@@ -1734,19 +1543,8 @@ export default {
           steps: 'Execution steps',
           noSteps: 'Hermes did not return a readable step list. Ask Hermes to update the draft.',
           needsAttention: 'Needs attention',
-          securityTitle: 'Hermes security',
-          securityInstall: 'Review this workflow before creating the job. Record does not add a separate permission or approval system; stock Hermes applies the selected profile’s approval policy at runtime.',
-          securityCronDeny: mode => `Interactive dangerous-command approvals are ${mode}. Scheduled dangerous commands are blocked (cron_mode: deny); Cron cannot pause for a person.`,
-          securityCronApprove: mode => `Interactive dangerous-command approvals are ${mode}. Scheduled dangerous commands are auto-approved (cron_mode: approve); Cron cannot pause for a person.`,
-          securityOff: 'Dangerous-command approvals are off for the selected Hermes profile, including scheduled runs.',
-          securityUnknown: mode => `Interactive dangerous-command approvals are ${mode}. Hermes Cron uses the selected profile’s headless approval policy and cannot pause for a person.`,
-          prompt: 'Show exact Hermes job prompt',
-          script: 'Show exact reviewed script',
-          scriptHash: 'SHA-256',
           starts: 'Starts',
-          scheduleSummary: 'This reviewed workflow will start on this Cron schedule.',
-          scheduleMissing: 'No schedule selected',
-          withHermes: 'Review with Hermes',
+          conversation: 'Ask Hermes a question or request a change',
           messageLabel: 'Message for Hermes',
           noMessages: 'No unresolved details. Ask Hermes a question or request a change.',
           loading: 'Loading the workflow review…',
@@ -1756,7 +1554,7 @@ export default {
           update: 'Update draft',
           updating: 'Updating…',
           turnOn: 'Turn on workflow',
-          turningOn: 'Turning on workflow…'
+          turningOn: 'Turning on workflow…',
         },
         installed: {
           title: 'Workflow is on',

@@ -9,7 +9,6 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -114,7 +113,6 @@ def save_review_conversation(recording_dir: Path, conversation: Mapping[str, Any
     return path
 
 
-_UNSET = object()
 _PUBLICATION_LOCK_TIMEOUT_SECONDS = 10.0
 _PUBLICATION_LOCK_POLL_SECONDS = 0.05
 _publication_thread_locks_guard = threading.Lock()
@@ -249,74 +247,22 @@ def record_slug(value: str, default: str = "workflow") -> str:
     return cleaned or default
 
 
-def compile_reviewed_recording(
+def prepare_recording_build(
     modules: Dict[str, Any],
     *,
     home: Path,
     profile_name: str,
     recording_dir: Path,
-    schedule: str,
-    run_mode: str = "schedule",
-    expected_draft_digest: str = "",
-    delivery_override: Any = _UNSET,
+    workflow: Dict[str, Any],
 ) -> Dict[str, Any]:
-    workflow_path = recording_dir / "workflow.json"
-    workflow = modules["compiler"].load_workflow(workflow_path)
-    digest = workflow_digest(workflow)
-    if expected_draft_digest and expected_draft_digest != digest:
-        raise HTTPException(status_code=409, detail="The reviewed draft changed. Review the latest cron draft before scheduling.")
-    review = workflow.get("review") if isinstance(workflow.get("review"), dict) else {}
-    # Install choices are a new immutable build, not a mutation of the draft
-    # the operator reviewed. This closes the check-then-rewrite race and keeps
-    # the displayed draft digest meaningful for concurrent requests.
-    workflow = deepcopy(workflow)
-    from .record.evidence import verified_capture_acceptance
+    """Stage and seal the exact job proposal while the draft is authored."""
 
-    review = dict(review)
-    review["capture_acceptance"] = verified_capture_acceptance(recording_dir)
-    workflow["review"] = review
-    run_mode = str(run_mode or "schedule").strip().lower()
-    if run_mode not in {"schedule", "webhook"}:
-        raise HTTPException(
-            status_code=400,
-            detail="run_mode must be schedule or webhook",
-        )
-    trigger = (
-        workflow.get("trigger")
-        if isinstance(workflow.get("trigger"), dict)
-        else {}
+    workflow_path = recording_dir / "workflow.json"
+    digest = workflow_digest(workflow)
+    review = workflow.get("review") if isinstance(workflow.get("review"), dict) else {}
+    workflow["job_spec"] = modules["compiler"].validate_job_spec(
+        workflow.get("job_spec")
     )
-    if run_mode == "webhook" and trigger.get("feasibility") != "supported":
-        reason = str(
-            trigger.get("reason")
-            or "Hermes could not verify an authenticated configurable webhook for this event."
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=f"This trigger cannot be created: {reason}",
-        )
-    if run_mode == "schedule" and not str(schedule or "").strip():
-        raise HTTPException(status_code=400, detail="Choose a Hermes schedule.")
-    workflow["run_mode"] = run_mode
-    workflow["schedule"] = (
-        "triggered" if run_mode == "webhook" else str(schedule).strip()
-    )
-    workflow["deliver"] = (
-        str(delivery_override).strip()
-        if delivery_override is not _UNSET
-        else "local"
-    )
-    execution = (
-        dict(workflow.get("execution"))
-        if isinstance(workflow.get("execution"), dict)
-        else None
-    )
-    if execution is None:
-        raise HTTPException(
-            status_code=400,
-            detail="The reviewed workflow has no execution plan.",
-        )
-    workflow["execution"] = execution
     workflow_id = record_slug(str(workflow.get("id") or recording_dir.parent.name))
     build_digest = workflow_digest(workflow)
     out_dir = record_builds_root(home) / (
@@ -384,6 +330,101 @@ def compile_reviewed_recording(
         "status": (
             "review_ready"
             if not publication_guard["requires_review_resolution"]
+            else "needs_attention"
+        ),
+    }
+
+
+def load_recording_build(
+    modules: Dict[str, Any],
+    *,
+    home: Path,
+    profile_name: str,
+    recording_dir: Path,
+    expected_draft_digest: str,
+    schedule: str,
+    run_mode: str,
+) -> Dict[str, Any]:
+    """Load the sealed proposal without compiling or rewriting it."""
+
+    workflow_path = recording_dir / "workflow.json"
+    workflow = modules["compiler"].load_workflow(workflow_path)
+    digest = workflow_digest(workflow)
+    if expected_draft_digest != digest:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed draft changed. Reload the workflow review.",
+        )
+    job_spec = modules["compiler"].validate_job_spec(workflow.get("job_spec"))
+    expected_schedule = (
+        "triggered"
+        if str(run_mode or "").strip().lower() == "webhook"
+        else str(schedule or "").strip()
+    )
+    if expected_schedule != job_spec.get("schedule"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The schedule changed after drafting. Draft the updated "
+                "Hermes job before approving it."
+            ),
+        )
+
+    build = workflow.get("build") if isinstance(workflow.get("build"), dict) else {}
+    build_dir = Path(str(build.get("build_dir") or "")).expanduser().resolve()
+    builds_root = record_builds_root(home).expanduser().resolve()
+    try:
+        build_dir.relative_to(builds_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed build reference is invalid.",
+        ) from exc
+    expected_envelope = str(build.get("review_envelope_sha256") or "")
+    if not expected_envelope:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed build is missing its sealed envelope.",
+        )
+    try:
+        envelope, actual_envelope = modules["review_receipt"].verify_review_envelope(
+            build_dir,
+            expected_sha256=expected_envelope,
+        )
+        payload = modules["review_receipt"].load_payload(build_dir)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed Hermes job build is invalid.",
+        ) from exc
+    expected_payload = {"action": "create", **job_spec}
+    if payload != expected_payload or envelope.get("payload") != expected_payload:
+        raise HTTPException(
+            status_code=409,
+            detail="The stored Hermes job no longer matches the reviewed draft.",
+        )
+    guard = envelope.get("publication_guard")
+    review_path = build_dir / "review.md"
+    return {
+        "profile": profile_name,
+        "recording_dir": str(recording_dir),
+        "workflow_path": str(workflow_path),
+        "build_dir": str(build_dir),
+        "workflow": workflow,
+        "draft_digest": digest,
+        "payload": payload,
+        "review_envelope": envelope,
+        "review_envelope_sha256": actual_envelope,
+        "review_markdown": (
+            review_path.read_text(encoding="utf-8")
+            if review_path.is_file()
+            else ""
+        ),
+        "publication_guard": guard,
+        "status": (
+            "review_ready"
+            if isinstance(guard, dict)
+            and not guard.get("requires_review_resolution")
             else "needs_attention"
         ),
     }

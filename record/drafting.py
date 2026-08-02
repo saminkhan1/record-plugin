@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -9,14 +10,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .compiler import (
-    CompileError,
-    review_blockers,
-    validate_draft_plan,
-)
+from .compiler import review_blockers
 
 
 class DraftingError(ValueError):
@@ -64,33 +62,6 @@ _CLARIFICATION_SCHEMA = {
         "state",
         "open_questions",
         "feedback_summary",
-    ],
-}
-_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "selection_reason": {"type": "string"},
-        "state_strategy": {"type": "string"},
-        "idempotency_strategy": {"type": "string"},
-        "steps": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "trigger": {"type": "object"},
-        "execution": {"type": "object"},
-        "warnings": {
-            "type": "array",
-            "items": {"type": "object"},
-        },
-    },
-    "required": [
-        "selection_reason",
-        "state_strategy",
-        "idempotency_strategy",
-        "steps",
-        "trigger",
-        "execution",
-        "warnings",
     ],
 }
 _RERECORD_LANGUAGE = re.compile(
@@ -283,7 +254,7 @@ def author_workflow(
     on_progress: Callable[..., None] | None = None,
     revision_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Ask Hermes' host-owned plugin LLM for one reviewable Cron plan."""
+    """Author and validate one ready-to-create Hermes Cron job proposal."""
 
     instructions = str(instructions or "").strip()
     if not instructions:
@@ -294,434 +265,251 @@ def author_workflow(
 
     _require_active_home(home)
     try:
-        from .runtime import complete_structured
+        from . import planner
+        from .runtime import run_agent
 
         compact_evidence = _compact_evidence(evidence)
-        skill_catalog = _relevant_skill_catalog(
-            instructions=instructions,
-            evidence=compact_evidence,
-        )
         if on_progress is not None:
             on_progress(
-                "llm.started",
-                "ctx.llm",
-                "Drafting from the reviewed recording",
+                "draft.discovery",
+                "Hermes Agent",
+                "Authoring the executable Hermes job",
             )
-        # Visual evidence stays untouched in the recording. Bounded temporary
-        # previews are attached directly to this one host-owned structured
-        # completion; the plugin never instantiates an agent, handles provider
-        # credentials, or creates a second tool loop.
         with tempfile.TemporaryDirectory(prefix="record-evidence-") as preview_dir:
+            raw_plan: Any = None
             recording_index = _recording_index(
                 recording_dir,
                 preview_root=Path(preview_dir),
             )
             trace_scope = f"{recording_dir.parent.name}:{recording_dir.name}"
-            result = complete_structured(
-                trace_scope=trace_scope,
-                instructions=_draft_prompt(
-                    instructions=instructions,
-                    evidence=compact_evidence,
-                    recording_index=recording_index,
-                    skill_catalog=skill_catalog,
-                    revision_context=revision_context,
-                ),
-                input=_structured_draft_inputs(
-                    recording_index=recording_index,
-                    skill_catalog=skill_catalog,
-                ),
-                json_schema=_PLAN_SCHEMA,
-                schema_name="record.workflow-plan",
-                purpose="workflow.draft",
-                temperature=0.0,
-                max_tokens=8192,
-                timeout=600,
+            task_id = f"record:planner:{trace_scope}:{uuid.uuid4().hex}"
+            workflow_id = str(evidence.get("workflow_id") or trace_scope)
+            schedule = str(evidence.get("requested_schedule") or "").strip()
+            if evidence.get("trigger_requested") is True:
+                schedule = "triggered"
+            job_defaults = {
+                "name": str(evidence.get("name") or instructions).strip(),
+                "schedule": schedule,
+                "deliver": "local",
+            }
+            script_namespace = (
+                "record/"
+                + hashlib.sha256(workflow_id.encode("utf-8")).hexdigest()[:16]
             )
-        if on_progress is not None:
-            on_progress(
-                "llm.completed",
-                "ctx.llm",
-                "Draft ready for compiler review",
+            planner.begin(
+                task_id,
+                job_defaults=job_defaults,
+                script_namespace=script_namespace,
             )
-        raw_plan = (
-            result.parsed
-            if isinstance(result.parsed, dict)
-            else _extract_json(str(result.text or ""))
-        )
-        try:
-            plan = validate_draft_plan(raw_plan)
-        except CompileError as exc:
-            # The compiler is the safety authority, but one model-authored
-            # shape mistake is not evidence that the workflow itself cannot be
-            # represented. Give the host-owned LLM one bounded, JSON-only
-            # repair call with the rejected plan and exact compiler feedback. The
-            # repaired plan still traverses the complete validator below.
+            run_result: dict[str, Any] | None = None
+            try:
+                run_result = run_agent(
+                    task_id=task_id,
+                    system_prompt=_planner_system_prompt(),
+                    user_message=_planner_user_message(
+                        instructions=instructions,
+                        evidence=compact_evidence,
+                        recording_index=recording_index,
+                        revision_context=revision_context,
+                    ),
+                    max_iterations=24,
+                    tool_progress_callback=on_progress,
+                    status_callback=on_progress,
+                    required_tools=["record_submit_draft"],
+                    full_capabilities=False,
+                    purpose="workflow.draft",
+                )
+            finally:
+                raw_plan = planner.finish(task_id)
+        if run_result is not None and run_result.get("failed") is True:
+            detail = str(
+                run_result.get("error")
+                or run_result.get("final_response")
+                or "model request failed"
+            )
+            raise DraftingError(_draft_failure_message(RuntimeError(detail)))
+        if raw_plan is None:
+            from .compiler import validate_draft_plan
+
+            raw_plan = validate_draft_plan(
+                _conservative_draft(instructions),
+                job_defaults=job_defaults,
+                script_namespace=script_namespace,
+            )
             if on_progress is not None:
                 on_progress(
-                    "llm.repair",
-                    "ctx.llm",
-                    "Correcting the draft against Hermes Cron",
+                    "draft.fallback",
+                    "Hermes job contract",
+                    "Using a conservative executable draft",
                 )
-            repair_result = complete_structured(
-                trace_scope=trace_scope,
-                instructions=_draft_repair_prompt(
-                    raw_plan=raw_plan,
-                    compiler_error=str(exc),
-                ),
-                input=[
-                    {
-                        "type": "text",
-                        "text": "Return the complete corrected workflow plan.",
-                    }
-                ],
-                json_schema=_PLAN_SCHEMA,
-                schema_name="record.workflow-plan-repair",
-                purpose="workflow.draft.repair",
-                temperature=0.0,
-                max_tokens=8192,
-                timeout=300,
+        if on_progress is not None:
+            on_progress(
+                "draft.completed",
+                "record_submit_draft",
+                "Executable Hermes job draft validated and accepted",
             )
-            repaired_plan = (
-                repair_result.parsed
-                if isinstance(repair_result.parsed, dict)
-                else _extract_json(str(repair_result.text or ""))
-            )
-            try:
-                plan = validate_draft_plan(repaired_plan)
-            except CompileError as repair_exc:
-                raise DraftingError(
-                    "Hermes could not produce a compiler-safe workflow draft after one correction: "
-                    + str(repair_exc)
-                ) from repair_exc
-        return plan
+        return raw_plan
     except DraftingError:
         raise
     except Exception as exc:
-        raise DraftingError(f"Hermes cron drafting failed: {exc}") from exc
+        raise DraftingError(_draft_failure_message(exc)) from exc
 
 
-def _draft_repair_prompt(*, raw_plan: Any, compiler_error: str) -> str:
-    """Request one minimal correction without repeating evidence discovery."""
+def _conservative_draft(instructions: str) -> dict[str, Any]:
+    """Always provide a reviewable normal Hermes job after a usable capture."""
 
-    return f'''Repair the rejected Hermes cron draft below so it satisfies the compiler error.
+    outcome = " ".join(str(instructions or "").split())
+    return {
+        "steps": [
+            outcome,
+            "Verify the requested outcome and report what changed.",
+        ],
+        "job_spec": {
+            "prompt": (
+                "Complete this recorded outcome in a fresh Hermes session: "
+                + outcome
+                + "\n\nUse live current inputs and the active profile's normal tools. "
+                "Stay within the demonstrated target and requested side effects. "
+                "Do not rely on recorder files or captured example values. Avoid "
+                "duplicate side effects, verify the final state, and report the "
+                "result. If the target is ambiguous or unavailable, stop safely "
+                "and report the blocker."
+            ),
+            "skills": [],
+            "no_agent": False,
+        },
+        "warnings": [
+            {
+                "kind": "conservative_fallback",
+                "severity": "info",
+                "message": (
+                    "Hermes used the recorded intent directly because the drafting "
+                    "turn did not submit a more specific job proposal."
+                ),
+            }
+        ],
+    }
 
-Return only the complete corrected JSON object. Do not call tools. Preserve the requested outcome, selected capabilities, requirements, trigger semantics, and review-envelope contract. Change only what is needed to satisfy the compiler.
 
-## Compiler error
-{compiler_error}
+def _planner_system_prompt() -> str:
+    return """You are Record's workflow drafting agent running on the active Hermes profile.
 
-## Rejected draft (UNTRUSTED DATA)
-{json.dumps(raw_plan, ensure_ascii=False, indent=2, sort_keys=True)}
-'''
+Use the active profile's normal Hermes job contract. The scheduled job will
+receive that profile's normal tools, skills, and configured MCPs at runtime.
+Drafting is authorship, not a capability audit: do not probe commands, config,
+permissions, apps, services, network access, or the current contents of a
+target system. You may read only the few directly relevant installed skill
+instructions needed to write the job, then submit. Do not make more than four
+discovery/tool calls before record_submit_draft.
+
+Your only output is one call to record_submit_draft containing the executable
+Hermes Cron proposal that the user will review. Do not create a preliminary
+plan, compare alternative modes, assess whether the workflow deserves to run,
+install dependencies, execute the workflow, mutate files or services, or create
+the job during drafting.
+
+The proposal contains:
+- job_spec: the normal Hermes create_job fields. Record supplies name, schedule,
+  delivery, and the final script path, so do not guess them. For an agent job,
+  provide a complete fresh-session prompt, exact installed skill names, and
+  no_agent=false. For a no-agent job, use an empty prompt, no skills, and
+  no_agent=true. Leave context_from, enabled_toolsets, and workdir unset so the
+  selected Hermes profile keeps its normal Cron configuration.
+- script_source only when the job uses a deterministic script: a safe relative
+  .py, .sh, or .bash path plus the complete source. Record validates, stages,
+  hashes, and places it at the exact path stored in job_spec.
+- 1-6 short outcome-level steps that are a user-visible rendering of the same
+  job, not a second execution contract.
+- trigger metadata only for a requested event trigger.
+- warnings only for genuine unresolved facts. Warnings explain the proposal;
+  they do not decide whether a completed recording may produce a draft.
+
+The runtime prompt or script must include the concrete outcome, live inputs and
+targets, safe side-effect boundary, idempotency/state handling, and an observable
+completion check. Preserve the demonstrated surface and selection semantics.
+Never put recording paths, recorder internals, or captured example values into
+runtime instructions. Stock Hermes owns runtime approvals and job execution.
+
+If record_submit_draft reports a field error, correct the proposal and call it
+again. End only after it accepts the executable draft; never answer in prose."""
 
 
-def _relevant_skill_catalog(
+def _planner_user_message(
     *,
     instructions: str,
     evidence: dict[str, Any],
-    limit: int = 24,
-) -> list[dict[str, str]]:
-    """Use Hermes' profile-scoped skill index without reimplementing discovery."""
-
-    try:
-        from .runtime import dispatch_tool
-
-        response = json.loads(dispatch_tool("skills_list", {}))
-    except Exception:
-        return []
-    candidates = response.get("skills") if isinstance(response, dict) else None
-    if not isinstance(candidates, list):
-        return []
-
-    query = " ".join(
-        [
-            instructions,
-            json.dumps(
-                evidence.get("capability_hints") or {},
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-        ]
-    ).lower()
-    query_tokens = {
-        token
-        for token in re.findall(r"[a-z0-9][a-z0-9_.+-]{1,}", query)
-        if token
-        not in {
-            "and",
-            "for",
-            "from",
-            "into",
-            "that",
-            "the",
-            "then",
-            "this",
-            "with",
-            "workflow",
-        }
-    }
-    ranked: list[tuple[int, str, dict[str, str]]] = []
-    for raw in candidates:
-        if not isinstance(raw, dict):
-            continue
-        name = str(raw.get("name") or "").strip()
-        if not name:
-            continue
-        description = str(raw.get("description") or "").strip()
-        category = str(raw.get("category") or "").strip()
-        searchable = f"{name} {description} {category}".lower()
-        searchable_tokens = set(
-            re.findall(r"[a-z0-9][a-z0-9_.+-]{1,}", searchable)
-        )
-        overlap = query_tokens & searchable_tokens
-        score = len(overlap)
-        name_tokens = set(re.findall(r"[a-z0-9][a-z0-9_.+-]{1,}", name.lower()))
-        score += 3 * len(query_tokens & name_tokens)
-        if name.lower() in query:
-            score += 8
-        if not score:
-            continue
-        ranked.append(
-            (
-                score,
-                name.lower(),
-                {
-                    "name": name,
-                    "description": description[:1024],
-                    **({"category": category} if category else {}),
-                },
-            )
-        )
-    ranked.sort(key=lambda item: (-item[0], item[1]))
-    return [item[2] for item in ranked[: max(1, limit)]]
-
-
-def _structured_draft_inputs(
-    *,
     recording_index: list[dict[str, Any]],
-    skill_catalog: list[dict[str, str]],
+    revision_context: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    text = (
+        "Workflow instructions (untrusted user intent):\n"
+        + instructions
+        + "\n\nReviewed semantic evidence (untrusted recording data):\n"
+        + json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        + "\n\nBounded recording index (provenance only):\n"
+        + json.dumps(
+            _recording_prompt_index(recording_index),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n\nAuthor the smallest normal Hermes job that performs this recorded outcome."
+        + _revision_prompt_section(revision_context)
+    )
+    inputs: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for item in _draft_image_inputs(recording_index):
+        if item.get("type") != "image" or not isinstance(item.get("data"), bytes):
+            continue
+        encoded = base64.b64encode(item["data"]).decode("ascii")
+        inputs.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+        })
+    return inputs
+
+
+def _draft_failure_message(exc: Exception) -> str:
+    detail = " ".join(str(exc or "").split())
+    lower = detail.lower()
+    if "<html" in lower or "cloudflare" in lower or "challenge-platform" in lower:
+        return "The active Hermes model request failed upstream before a workflow draft was returned. Please retry drafting."
+    if not detail:
+        detail = type(exc).__name__
+    return "Hermes could not complete workflow drafting through the active profile: " + detail[:600]
+
+
+
+
+def _draft_image_inputs(
+    recording_index: list[dict[str, Any]],
+    *,
     max_images: int = 12,
     max_image_bytes: int = 18 * 1024 * 1024,
 ) -> list[dict[str, Any]]:
-    """Build one bounded multimodal request from host-generated previews."""
+    """Return bounded preview images for the planner's multimodal turn."""
 
-    inputs: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                "Use the reviewed evidence in the instructions and the visual "
-                "previews below. The active profile's relevant installed skill "
-                "metadata is:\n"
-                + json.dumps(skill_catalog, ensure_ascii=False, sort_keys=True)
-            ),
-        }
-    ]
-    candidates: list[tuple[str, Path]] = []
+    paths: list[Path] = []
     for entry in recording_index:
         if not isinstance(entry, dict):
             continue
-        relative = str(entry.get("path") or "visual evidence")
-        inspection_path = entry.get("inspection_path")
-        if isinstance(inspection_path, str) and inspection_path:
-            candidates.append((relative, Path(inspection_path)))
-        frames = entry.get("inspection_frames")
-        if not isinstance(frames, list):
-            continue
-        for frame in frames:
-            if not isinstance(frame, dict):
-                continue
-            frame_path = frame.get("inspection_path")
-            if not isinstance(frame_path, str) or not frame_path:
-                continue
-            at_seconds = frame.get("at_seconds")
-            label = (
-                f"{relative} at {at_seconds}s"
-                if isinstance(at_seconds, (int, float))
-                else relative
-            )
-            candidates.append((label, Path(frame_path)))
+        if isinstance(entry.get("inspection_path"), str):
+            paths.append(Path(entry["inspection_path"]))
+        for frame in entry.get("inspection_frames") or []:
+            if isinstance(frame, dict) and isinstance(frame.get("inspection_path"), str):
+                paths.append(Path(frame["inspection_path"]))
 
+    inputs: list[dict[str, Any]] = []
     consumed = 0
-    attached = 0
-    for label, path in candidates:
-        if attached >= max_images:
-            break
+    for path in paths[:max_images]:
         try:
             size = path.stat().st_size
-            if (
-                not path.is_file()
-                or size <= 0
-                or size > 5 * 1024 * 1024
-                or consumed + size > max_image_bytes
-            ):
+            if not path.is_file() or not 0 < size <= 5 * 1024 * 1024 or consumed + size > max_image_bytes:
                 continue
             data = path.read_bytes()
         except OSError:
             continue
-        inputs.append(
-            {
-                "type": "text",
-                "text": f"Visual evidence: {label}",
-            }
-        )
-        inputs.append(
-            {
-                "type": "image",
-                "data": data,
-                "mime_type": "image/jpeg",
-                "file_name": path.name,
-            }
-        )
-        consumed += len(data)
-        attached += 1
-    if not attached:
-        inputs.append(
-            {
-                "type": "text",
-                "text": "No bounded visual preview was available; rely on the semantic recording evidence.",
-            }
-        )
+        inputs.append({"type": "image", "data": data, "mime_type": "image/jpeg", "file_name": path.name})
+        consumed += size
     return inputs
-
-
-def _draft_prompt(
-    *,
-    instructions: str,
-    evidence: dict[str, Any],
-    recording_index: list[dict[str, Any]],
-    skill_catalog: list[dict[str, str]],
-    revision_context: dict[str, Any] | None = None,
-) -> str:
-    return f'''Create one reliable native Hermes cron execution plan from the workflow instructions and reviewed recording evidence below.
-
-The recording is the source of truth for what the workflow does. Recreate the demonstrated sequence with the runtime tools that correspond to the recorded browser, application, and action surfaces. Remove only passive recorder noise, and preserve the requested outcome, targets, side-effect boundary, and observable proof of success. Choose the execution shape that reproduces that behavior:
-- no-agent script for deterministic work that can complete and verify itself;
-- hybrid script plus agent for deterministic collection or gating followed by judgment;
-- agent-only when the task inherently needs live reasoning or Hermes tools.
-
-This is one host-owned `ctx.llm` completion, not another Hermes agent. It cannot
-call tools or mutate state. The host has already supplied compact semantic
-evidence, bounded visual previews, and the relevant portion of the active
-profile's installed skill index. Use only those inputs. The result is a draft
-for human review, never an installed job.
-
-Use this evidence ladder:
-- Start with the compact semantic steps, causal effects, application/window/container identity, and artifact index.
-- Use an attached screenshot or video frame when visual state is the strongest
-  evidence: an ambiguous control, spatial/container identity, visual-only
-  success state, native-app state, or a change over time.
-- Treat the bundle index as provenance. Local paths are not callable inputs and
-  must never appear in the runtime plan.
-- If the supplied evidence cannot support a material detail, record the exact
-  uncertainty in warnings instead of inventing it.
-
-Normalize the demonstrated behavior, not the recorder's implementation noise. Treat passive child-frame navigations, background helpers, duplicated provider observations, focus churn, and repeated route notifications as incidental unless the operator acted on that surface or it changes the outcome. Preserve cross-origin authentication/payment handoffs, actions inside embedded frames, user-visible application transitions, and committed side effects.
-
-Use exact skill names from the supplied active-profile index; bundled skills are
-not category-qualified. Do not invent, install, or configure a skill.
-
-Prefer the same application or browser surface and the same action type the operator demonstrated. Use a different integration only when the instructions explicitly request it or the recorded path is unavailable, and state that reason in selection_reason.
-
-Determine whether the operator selected or described an event trigger (for
-example “when”, “whenever”, “after a new…”, “on receipt”, or “if an issue is
-opened”). A trigger is separate from the demonstrated workflow body:
-- Recommend a webhook only when the originating service can be configured to
-  POST the event and the available evidence establishes compatibility with
-  Hermes ingress: GitHub `X-Hub-Signature-256`, GitLab `X-Gitlab-Token`, or
-  generic HMAC-SHA256 using
-  `X-Webhook-Signature-V2` plus `X-Webhook-Timestamp` (legacy
-  `X-Webhook-Signature` is accepted but weaker).
-- Common feasible sources include GitHub/GitLab repository events, custom
-  backends, and automation systems that can send the generic HMAC headers. Use
-  a narrow event list and declarative payload filters when the provider sends a
-  broader stream.
-- Do not claim direct support for local file/app/desktop state changes,
-  arbitrary website changes, inbox or calendar changes that require Hermes to
-  establish an OAuth watch subscription, or time-of-day conditions. A provider
-  name alone is not proof: when its signing or verification handshake is not
-  demonstrably compatible with one of the accepted Hermes headers, mark the
-  trigger unsupported.
-- If an event was selected or requested but the evidence does not establish an
-  authenticated configurable webhook, set feasibility=unsupported and explain
-  exactly why. Never silently translate it into a schedule. If no event was
-  selected or inferred, use not_requested.
-- Triggered workflow scripts receive one authenticated event envelope as JSON
-  on stdin. Triggered agent runs receive the same envelope as clearly marked
-  untrusted data before the reviewed runbook. Consume current event fields
-  rather than captured example values.
-
-Preserve demonstrated selection semantics, including content subtype, active list or container, filters, account scope, and destination. Do not silently broaden “video” to Shorts, “task” to another list, or a filtered result to an unfiltered feed.
-
-For agent or hybrid execution, write execution.prompt as the complete runbook for a fresh cron session with no recording or conversation memory. Include the concrete outcome, inputs and targets, safe side-effect boundary, approach, idempotency/state strategy, and an observable completion check. Attach every selected existing skill in execution.skills. Leave execution.enabled_toolsets empty so stock Hermes applies the selected profile's normal Cron tool configuration. For no-agent execution, put the complete procedure and verification in the script body.
-
-Record review is an install-time contract. Stock Hermes owns all run-time
-approval behavior. Do not emit authorization, approval, checkpoint, or routing
-metadata. When execution.script is present, the setup screen shows its exact
-source and SHA-256, and Record's review envelope and receipt bind that source
-and the canonical Cron payload before installation.
-
-Treat captured values as evidence, not reusable constants, unless the workflow instructions explicitly establish them as constants. Never guess missing credentials, accounts, targets, paths, or material choices; constrain the plan to demonstrated access and list remaining uncertainty in warnings. Do not create a skill, plugin, supporting job, schedule, delivery rule, model override, provider override, profile, or workdir.
-
-Do not put a command or app query in the final runbook after the capability pass proved it unavailable. If an unavailable CLI was only one possible way to read state, use a verified selected UI/tool path instead; otherwise return a blocking warning rather than emitting a runbook that is guaranteed to stop before its outcome.
-
-Return only one JSON object:
-{{
-  "selection_reason": "why this native execution shape is smallest and reliable",
-  "state_strategy": "durable state strategy or not_required",
-  "idempotency_strategy": "deduplication strategy or not_required",
-  "steps": ["2-6 short, outcome-level actions the user can recognize"],
-  "trigger": {{
-    "requested": false,
-    "feasibility": "not_requested|supported|unsupported",
-    "description": "plain-language event, or empty only when not_requested",
-    "source": "provider or system name, or null",
-    "events": ["narrow provider event names, or []"],
-    "filters": null,
-    "reason": "specific evidence for feasibility or why this trigger cannot be created"
-  }},
-  "execution": {{
-    "no_agent": false,
-    "script": null,
-    "prompt": "self-contained runtime runbook, or null for no-agent",
-    "skills": ["applicable existing skills in load order"],
-    "enabled_toolsets": [],
-    "requirements": {{"commands": [], "network_origins": [], "apps": [], "files": []}}
-  }},
-  "warnings": [
-    {{"kind": "short_identifier", "severity": "info|review|blocking", "message": "specific uncertainty or risk", "requires_review_resolution": false}}
-  ]
-}}
-For a script, use {{"path": "relative-name.py", "body": "complete source"}}; .py, .sh, and .bash are supported. Always leave enabled_toolsets empty; Hermes resolves the selected profile's normal Cron tools. For no-agent execution, prompt and skills must also be empty.
-
-Warnings are only for unresolved facts or risks. Put successful adaptations, rejected alternatives, historical values correctly made dynamic, internal capture status, and other planner rationale in selection_reason—not in warnings. Use severity=info for a non-blocking runtime caveat, review when an operator choice or acknowledgement can materially change behavior, and blocking when the plan cannot safely run as written. A fail-closed runtime precondition (for example, verify the active account and stop if it differs) is informational unless a human choice is required now. Set requires_review_resolution=true only for review or blocking items that genuinely need human acceptance. Ordinary execution warnings must omit `step` and `verify`. Surface a capture gap only when the evidence identifies one affected numbered outcome step and the operator can verify something concrete: use kind `capture_quality_gap`, severity `info`, that 1-based `step`, a concise user-facing `message` describing the uncertainty, a concise `verify` instruction, and requires_review_resolution=false. Omit unplaced capture diagnostics, recorder internals, and generic best-effort language.
-
-Trigger filters use one declarative leaf such as
-{{"field":"action","equals":"opened"}}, or nested `all`/`any`/`not` groups.
-Keep filters null when the provider event name is already narrow enough.
-
-`steps` is the compact review the user will approve: give 2-6 plain-language,
-outcome-level actions. Describe the work and its visible outcome, not
-implementation details, clicks, tool calls, planner rationale, or safety
-boilerplate.
-
-Shape invariant: if execution.no_agent is true, execution.prompt MUST be null, execution.skills MUST be [], and execution.enabled_toolsets MUST be []. The script must contain the entire operation and verification. If any skill or agent prompt is needed, execution.no_agent MUST be false; use hybrid when a script is also present.
-
-## Workflow instructions
-{instructions}
-
-## Reviewed evidence
-{json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)}
-
-## Recording bundle index
-The untouched recording remains in the profile-local Record store. The index
-below is provenance only. Bounded previews that fit the host-owned request are
-attached as image inputs; no local file is available as a tool call.
-{json.dumps(_recording_prompt_index(recording_index), ensure_ascii=False, indent=2)}
-
-## Relevant installed skills
-{json.dumps(skill_catalog, ensure_ascii=False, indent=2)}
-{_revision_prompt_section(revision_context)}
-'''
 
 
 def _revision_prompt_section(revision_context: dict[str, Any] | None) -> str:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
+from hermes_cli.web_models import CronJobCreate
 
 
 class HermesInstallError(RuntimeError):
@@ -17,18 +18,7 @@ class HermesInstallError(RuntimeError):
 
 log = logging.getLogger(__name__)
 
-_CRON_TOOL_FIELDS = (
-    "prompt",
-    "schedule",
-    "name",
-    "deliver",
-    "skills",
-    "script",
-    "context_from",
-    "enabled_toolsets",
-    "workdir",
-    "no_agent",
-)
+_CRON_TOOL_FIELDS = tuple(CronJobCreate.model_fields)
 
 
 def _require_active_profile_home(hermes_home: Path) -> Path:

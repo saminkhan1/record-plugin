@@ -13,7 +13,8 @@ from hermes_plugins.record.record import (
     hermes,
     recording,
 )
-from hermes_plugins.record import chrome_capture, hermes_recorder
+from hermes_plugins.record import chrome_capture, hermes_recorder, record_recorder
+from hermes_plugins.record.recording_bundle import write_json
 from hermes_plugins.record.hermes_recorder import discard_native_recording
 from hermes_plugins.record.record.trace_schema import (
     LEGACY_SCHEMA_VERSION,
@@ -698,23 +699,19 @@ def _captured_customer_actions() -> list[dict]:
 
 def _draft_plan() -> dict:
     return {
-        "selection_reason": "The workflow needs live browser access.",
-        "state_strategy": "not_required",
-        "idempotency_strategy": "Check the inbox before changing it.",
-        "steps": ["Archive the demonstrated customer message and verify it is no longer in the inbox."],
-        "execution": {
+        "steps": [
+            "Archive the demonstrated customer message.",
+            "Verify it is no longer in the inbox.",
+        ],
+        "job_spec": {
+            "name": "Profile-owned tools",
+            "schedule": "0 9 * * *",
+            "deliver": "local",
             "no_agent": False,
-            "script": None,
             "prompt": "Archive the demonstrated message and verify the result.",
             "skills": [],
-            "enabled_toolsets": ["browser"],
-            "requirements": {
-                "commands": [],
-                "network_origins": ["https://mail.example.test"],
-                "apps": ["Google Chrome"],
-                "files": [],
-            },
         },
+        "script_source": None,
         "trigger": {
             "requested": False,
             "feasibility": "not_requested",
@@ -730,7 +727,7 @@ def _draft_plan() -> dict:
 
 def test_selected_profile_keeps_its_full_cron_tool_configuration(tmp_path):
     plan = _draft_plan()
-    plan["execution"]["enabled_toolsets"] = []
+    plan["job_spec"]["enabled_toolsets"] = []
 
     normalized = compiler.validate_draft_plan(plan)
     workflow = {
@@ -745,18 +742,64 @@ def test_selected_profile_keeps_its_full_cron_tool_configuration(tmp_path):
         tmp_path / "build",
     )
 
-    assert compiled.payload["enabled_toolsets"] is None
+    assert "enabled_toolsets" not in compiled.payload
     assert "enabled_toolsets" not in hermes._cron_tool_arguments(
         "create",
         compiled.payload,
     )
 
-    plan["execution"]["enabled_toolsets"] = ["browser"]
+    plan["job_spec"]["enabled_toolsets"] = ["browser"]
     with pytest.raises(
         compiler.CompileError,
-        match="selected Hermes profile owns Cron tool configuration",
+        match="enabled_toolsets.*at most 0 items",
     ):
         compiler.validate_draft_plan(plan)
+
+
+def test_approval_loads_the_sealed_job_without_recompiling(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    recording_dir = home / "record" / "recordings" / "workflow" / "session"
+    recording_dir.mkdir(parents=True)
+    workflow = {
+        "id": "workflow",
+        "name": "Profile-owned tools",
+        "instructions": "Archive the message and verify it.",
+        **compiler.validate_draft_plan(_draft_plan()),
+        "review": {"draft_revision": 1},
+    }
+    modules = record_recorder.load_record_modules()
+    prepared = record_recorder.prepare_recording_build(
+        modules,
+        home=home,
+        profile_name="default",
+        recording_dir=recording_dir,
+        workflow=workflow,
+    )
+    workflow["build"] = {
+        "build_dir": prepared["build_dir"],
+        "review_envelope_sha256": prepared["review_envelope_sha256"],
+    }
+    write_json(recording_dir / "workflow.json", workflow)
+    digest = record_recorder.workflow_digest(workflow)
+
+    monkeypatch.setattr(
+        modules["compiler"],
+        "compile_workflow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("approval must not compile")
+        ),
+    )
+    loaded = record_recorder.load_recording_build(
+        modules,
+        home=home,
+        profile_name="default",
+        recording_dir=recording_dir,
+        expected_draft_digest=digest,
+        schedule="0 9 * * *",
+        run_mode="schedule",
+    )
+
+    assert loaded["payload"] == {"action": "create", **workflow["job_spec"]}
 
 
 def test_drafting_surfaces_warning_when_required_chrome_actions_were_not_captured(tmp_path):

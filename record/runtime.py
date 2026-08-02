@@ -106,6 +106,42 @@ def complete_structured(
     return result
 
 
+def run_agent(
+    *,
+    user_message: Any,
+    system_prompt: str,
+    task_id: str,
+    max_iterations: int = 24,
+    tool_progress_callback: Any = None,
+    status_callback: Any = None,
+    required_tools: list[str] | None = None,
+    full_capabilities: bool = False,
+    purpose: str = "workflow.draft",
+) -> dict[str, Any]:
+    """Run one full-capability, host-owned Hermes agent turn.
+
+    ``ctx.agent`` resolves the active profile's model, provider, credentials,
+    fallback, normal toolsets, skills, and MCP catalog. Record supplies only
+    the ephemeral planning prompt and task correlation id.
+    """
+
+    context = _plugin_context()
+    result = context.agent.run(
+        user_message=user_message,
+        system_prompt=system_prompt,
+        task_id=task_id,
+        max_iterations=max_iterations,
+        tool_progress_callback=tool_progress_callback,
+        status_callback=status_callback,
+        required_tools=required_tools,
+        full_capabilities=full_capabilities,
+        purpose=purpose,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Hermes planning agent returned an invalid result")
+    return result
+
+
 def _publish_llm_lifecycle(
     *,
     kwargs: dict[str, Any],

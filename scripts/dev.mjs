@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { clean, cleanCaches } from './clean.mjs'
-import { runtimeFiles } from './runtime-files.mjs'
+import { runtimeFiles, validateRuntimeFiles } from './runtime-files.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const defaultHermesHome = path.join(os.homedir(), '.hermes')
@@ -165,6 +165,7 @@ function main() {
   requireFile(path.join(hostRoot, 'apps', 'desktop', 'package.json'), 'Hermes Desktop source')
   requireFile(hermesBin, 'Hermes launcher')
   requireFile(hermesPython, 'Hermes Python')
+  validateRuntimeFiles(repoRoot)
 
   console.log('==> Cleaning Record build outputs')
   clean()

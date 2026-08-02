@@ -125,7 +125,6 @@ def build_draft_candidate(
             "kind": "capture_quality_gap",
             "code": "evidence_index_unavailable",
             "severity": "review",
-            "requires_review_resolution": False,
             "message": (
                 "The derived evidence index could not be read, so this draft uses the stopped trace and instructions. "
                 f"Review the affected steps. ({type(exc).__name__})"
@@ -253,10 +252,9 @@ def _workflow_from_cron_plan(
 ) -> dict[str, Any]:
     if not isinstance(authored, dict):
         raise RecordingError("Hermes cron drafter returned a non-object")
-    execution = authored.get("execution")
-    if not isinstance(execution, dict):
-        raise RecordingError("Hermes cron drafter did not return execution metadata")
-    requirements = execution.get("requirements") if isinstance(execution.get("requirements"), dict) else {}
+    job_spec = authored.get("job_spec")
+    if not isinstance(job_spec, dict):
+        raise RecordingError("Hermes cron drafter did not return a job specification")
     raw_warnings = authored.get("warnings")
     if not isinstance(raw_warnings, list) or not all(
         isinstance(warning, dict) for warning in raw_warnings
@@ -264,38 +262,31 @@ def _workflow_from_cron_plan(
         raise RecordingError("Hermes cron drafter returned unvalidated warnings")
     execution_warnings = [dict(warning) for warning in raw_warnings]
 
-    runtime_apps = _unique_strings(requirements.get("apps"))
-    runtime_origins = _unique_strings(requirements.get("network_origins"))
-    runtime_files = _unique_strings(requirements.get("files"))
-    runtime_commands = _unique_strings(requirements.get("commands"))
-    runtime_toolsets = _unique_strings(execution.get("enabled_toolsets"))
-    checks = ["Recording bundle contains structured desktop/browser/file events"]
-    checks.extend(f"Required command available: {command}" for command in runtime_commands)
-    checks.extend(f"Required app available: {app}" for app in runtime_apps)
-    checks.extend(f"Required network origin reachable: {origin}" for origin in runtime_origins)
-    if runtime_toolsets:
-        checks.append("Selected Hermes cron toolsets are available")
-
     review = dict(review)
     review.update({
-        "selection_reason": str(authored.get("selection_reason") or ""),
-        "llm_policy": str(authored.get("llm_policy") or ""),
-        "state_strategy": str(authored.get("state_strategy") or ""),
-        "idempotency_strategy": str(authored.get("idempotency_strategy") or ""),
+        "llm_policy": (
+            "never"
+            if job_spec.get("no_agent") is True
+            else ("on_change" if job_spec.get("script") else "every_run")
+        ),
         "execution_steps": _unique_strings(authored.get("steps")),
         "recording_warnings": recording_warnings,
         "warnings": execution_warnings,
-        "required_apps": runtime_apps,
-        "required_browser_origins": runtime_origins,
-        "required_files": runtime_files,
-        "required_commands": runtime_commands,
-        "preflight_checks": checks,
+        "preflight_checks": [
+            "Recording bundle contains structured desktop/browser/file events",
+            "The reviewed Hermes job specification validates against the active host",
+        ],
     })
     workflow: dict[str, Any] = {
         "id": workflow_id,
         "name": title,
         "instructions": instructions,
-        "execution": execution,
+        "job_spec": job_spec,
+        "script_source": (
+            authored.get("script_source")
+            if isinstance(authored.get("script_source"), dict)
+            else None
+        ),
         "trigger": authored.get("trigger") if isinstance(authored.get("trigger"), dict) else {},
         "review": review,
     }
@@ -473,7 +464,6 @@ def _capture_quality_warnings(
             "kind": "capture_quality_gap",
             "code": code,
             "severity": "review",
-            "requires_review_resolution": False,
             "message": message,
         }
         if details:
@@ -773,7 +763,6 @@ def _trace_missing_side_effect_warnings(rows: list[dict[str, Any]]) -> list[dict
                     warnings.append({
                         "step_id": None,
                         "kind": "missing_side_effect_action",
-                        "requires_review_resolution": True,
                         "trace_id": pending.get("trace_id"),
                         "message": (
                             "Text was entered in "
@@ -801,7 +790,6 @@ def _trace_missing_side_effect_warnings(rows: list[dict[str, Any]]) -> list[dict
         warnings.append({
             "step_id": None,
             "kind": "missing_side_effect_action",
-            "requires_review_resolution": True,
             "trace_id": pending.get("trace_id"),
             "message": (
                 "Text was entered in "
@@ -841,14 +829,12 @@ def _trace_warnings(rows: list[dict[str, Any]], steps: list[dict[str, Any]], pre
             "kind": kind,
             "trace_ids": trace_ids,
             "message": message,
-            "requires_review_resolution": kind in {"missing_target", "missing_replay_data", "chrome_provider_unavailable"},
         })
     warnings.extend(_trace_missing_side_effect_warnings(rows))
     if preconditions.get("operator_review_required"):
         warnings.append({
             "step_id": None,
             "kind": "browser_profile_unverified",
-            "requires_review_resolution": False,
             "message": (
                 "Chrome did not expose a stable browser-profile identity; verify "
                 "the intended signed-in Chrome account before scheduling."
@@ -863,7 +849,6 @@ def _trace_warnings(rows: list[dict[str, Any]], steps: list[dict[str, Any]], pre
                 "step_id": step.get("id"),
                 "kind": str(warning),
                 "message": f"{step.get('id')}: readiness warning {warning}",
-                "requires_review_resolution": str(warning) in {"missing_browser_readiness", "missing_desktop_readiness", "browser_profile_unverified"},
             })
     return warnings
 
@@ -1667,7 +1652,6 @@ def _warnings_for_step(step: dict[str, Any]) -> list[dict[str, Any]]:
         warnings.append({
             "step_id": step.get("id"),
             "kind": "low_confidence",
-            "requires_review_resolution": False,
             "message": f"{step.get('id')}: review low-confidence {low_surface} action before replay.",
         })
     semantic_candidates = [
@@ -1679,21 +1663,18 @@ def _warnings_for_step(step: dict[str, Any]) -> list[dict[str, Any]]:
         warnings.append({
             "step_id": step.get("id"),
             "kind": "coordinate_target",
-            "requires_review_resolution": True,
             "message": f"{step.get('id')}: coordinate-only target should be confirmed or replaced with an accessibility/DOM target.",
         })
     if str(target.get("surface_type") or "").lower() in {"canvas", "remote_desktop", "custom_rendered"}:
         warnings.append({
             "step_id": step.get("id"),
             "kind": "weak_surface",
-            "requires_review_resolution": False,
             "message": f"{step.get('id')}: weak UI surface needs human review before replay.",
         })
     if _step_needs_browser_auth(step):
         warnings.append({
             "step_id": step.get("id"),
             "kind": "browser_auth",
-            "requires_review_resolution": False,
             "message": f"{step.get('id')}: captured browser page appears unauthenticated; sign in and re-record this browser step.",
         })
     return warnings
@@ -2109,16 +2090,6 @@ def _draft_review_markdown(
         "## Inputs And Requirements",
         "",
     ]
-    if review.get("selection_reason"):
-        lines.extend([
-            "## Selected Hermes Cron Job",
-            "",
-            f"- LLM policy: {review.get('llm_policy')}",
-            f"- Selection: {review.get('selection_reason')}",
-            f"- State: {review.get('state_strategy')}",
-            f"- Idempotency: {review.get('idempotency_strategy')}",
-            "",
-        ])
     for label, key in (
         ("Replay inputs", "inputs"),
         ("Required apps", "required_apps"),

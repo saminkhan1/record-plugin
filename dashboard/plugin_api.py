@@ -27,7 +27,8 @@ discover_plugins()
 
 from hermes_plugins.record.record_recorder import (  # noqa: E402
     _recording_digest,
-    compile_reviewed_recording,
+    load_recording_build,
+    prepare_recording_build,
     record_slug,
     load_record_modules,
     load_review_conversation,
@@ -75,13 +76,14 @@ class _DraftOperation:
     error: str = ""
     cancel_requested: bool = False
     progress: List[Dict[str, Any]] = field(default_factory=list)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.RLock = field(default_factory=threading.RLock)
     created_monotonic: float = field(default_factory=time.monotonic)
     last_activity_monotonic: float = field(default_factory=time.monotonic)
     finished_monotonic: Optional[float] = None
     worker: Optional[threading.Thread] = None
     worker_started: bool = False
     terminal_event: threading.Event = field(default_factory=threading.Event)
+    phase: str = "discovery"
 
     def _touch_locked(self) -> None:
         self.last_activity_monotonic = time.monotonic()
@@ -112,6 +114,7 @@ class _DraftOperation:
                         self._finish_locked()
                 return False
             self.status = "finalizing"
+            self.phase = "compiling"
             self._touch_locked()
             return True
 
@@ -129,6 +132,7 @@ class _DraftOperation:
             self.result = result
             self.error = ""
             self.status = "completed"
+            self.phase = "complete"
             self._finish_locked()
             return True
 
@@ -152,7 +156,6 @@ class _DraftOperation:
 
     def ensure_terminal(self) -> None:
         """Close any worker path that unwound without declaring an outcome."""
-
         self.fail("Workflow drafting stopped before it produced a result. Please retry.")
 
     def on_progress(
@@ -175,6 +178,11 @@ class _DraftOperation:
         if details.get("is_error") is not None:
             entry["is_error"] = bool(details["is_error"])
         with self.lock:
+            phase_map = {
+                "draft.discovery": "discovery",
+                "draft.completed": "complete",
+            }
+            self.phase = phase_map.get(str(event_type), self.phase)
             self.progress.append(entry)
             self.progress = self.progress[-50:]
             self._touch_locked()
@@ -253,6 +261,7 @@ def _draft_operation_payload(operation: _DraftOperation) -> Dict[str, Any]:
             "recording_dir": str(operation.recording_dir),
             "status": operation.status,
             "progress": list(operation.progress),
+            "phase": operation.phase,
         }
         if operation.status == "completed":
             payload["result"] = operation.result
@@ -404,7 +413,6 @@ class RecordScheduleRecordingRequest(BaseModel):
     run_mode: str = "schedule"
     expected_draft_digest: str = Field(min_length=1)
     publish: bool = False
-    expected_review_envelope_sha256: Optional[str] = None
 
 
 class RecordSetJobRequest(BaseModel):
@@ -453,19 +461,11 @@ def _public_review_thread(thread: dict[str, Any]) -> dict[str, Any]:
 
 
 def _script_review(workflow: dict[str, Any]) -> dict[str, str] | None:
-    execution = (
-        workflow.get("execution")
-        if isinstance(workflow.get("execution"), dict)
-        else {}
-    )
-    script = (
-        execution.get("script")
-        if isinstance(execution.get("script"), dict)
-        else None
-    )
+    job_spec = workflow.get("job_spec") if isinstance(workflow.get("job_spec"), dict) else {}
+    script = workflow.get("script_source") if isinstance(workflow.get("script_source"), dict) else None
     if script is None:
         return None
-    path = script.get("path")
+    path = job_spec.get("script")
     source = script.get("body")
     if (
         not isinstance(path, str)
@@ -573,8 +573,8 @@ def _revision_context(
     thread: dict[str, Any],
 ) -> dict[str, Any]:
     review = workflow.get("review") if isinstance(workflow.get("review"), dict) else {}
-    execution = workflow.get("execution") if isinstance(workflow.get("execution"), dict) else {}
-    script = execution.get("script") if isinstance(execution.get("script"), dict) else {}
+    job_spec = workflow.get("job_spec") if isinstance(workflow.get("job_spec"), dict) else {}
+    script = workflow.get("script_source") if isinstance(workflow.get("script_source"), dict) else {}
     operator_messages = [
         str(message.get("display_content") or message.get("content") or "").strip()
         for message in thread.get("messages", [])
@@ -590,9 +590,10 @@ def _revision_context(
         "prior_plan": {
             "review_outline": list(review.get("execution_steps") or []),
             "trigger": workflow.get("trigger") if isinstance(workflow.get("trigger"), dict) else {},
-            "execution": {
-                "prompt": execution.get("prompt"),
-                "requirements": execution.get("requirements"),
+            "job_spec": {
+                "prompt": job_spec.get("prompt"),
+                "skills": job_spec.get("skills"),
+                "no_agent": job_spec.get("no_agent"),
                 "script_path": script.get("path"),
             },
         },
@@ -645,9 +646,14 @@ def _publish_staged_artifacts(staged: list[tuple[Path, Path]]) -> None:
 
 
 def _candidate_artifacts(candidate: Any, conversation: dict[str, Any] | None = None) -> list[tuple[Path, bytes]]:
+    review_markdown = candidate.review_markdown
+    build = candidate.workflow.get("build") if isinstance(candidate.workflow.get("build"), dict) else {}
+    build_review = Path(str(build.get("build_dir") or "")) / "review.md"
+    if build_review.is_file():
+        review_markdown = build_review.read_text(encoding="utf-8")
     artifacts = [
         (candidate.output, (json.dumps(candidate.workflow, indent=2, sort_keys=True) + "\n").encode("utf-8")),
-        (candidate.recording_dir / "draft-review.md", candidate.review_markdown.encode("utf-8")),
+        (candidate.recording_dir / "draft-review.md", review_markdown.encode("utf-8")),
         (candidate.recording_dir / "metadata.json", (json.dumps(candidate.metadata, indent=2, sort_keys=True) + "\n").encode("utf-8")),
     ]
     if conversation is not None:
@@ -666,8 +672,7 @@ def _review_seed(
     compiler: Any,
 ) -> str:
     review = workflow.get("review") if isinstance(workflow.get("review"), dict) else {}
-    execution = workflow.get("execution") if isinstance(workflow.get("execution"), dict) else {}
-    requirements = execution.get("requirements") if isinstance(execution.get("requirements"), dict) else {}
+    job_spec = workflow.get("job_spec") if isinstance(workflow.get("job_spec"), dict) else {}
     facts = {
         "draft_digest": draft_digest,
         "draft_revision": draft_revision,
@@ -676,12 +681,7 @@ def _review_seed(
         "steps": review.get("execution_steps") if isinstance(review.get("execution_steps"), list) else [],
         "blockers": compiler.review_blockers(workflow),
         "trigger": workflow.get("trigger") if isinstance(workflow.get("trigger"), dict) else {},
-        "required_apps": requirements.get("apps") if isinstance(requirements.get("apps"), list) else [],
-        "requirements": {
-            key: requirements.get(key)
-            for key in ("commands", "network_origins", "apps", "files")
-            if isinstance(requirements.get(key), list)
-        },
+        "job_spec": job_spec,
     }
     return json.dumps(facts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -1167,9 +1167,12 @@ def draft_recording_only(recording_key: str, body: RecordRecordingDraftOnlyReque
                 )
 
             def author(context: dict[str, Any]) -> dict[str, Any]:
+                author_context = dict(context)
+                if body.schedule.strip():
+                    author_context["requested_schedule"] = body.schedule.strip()
                 return modules["drafting"].author_workflow(
                     body.instructions.strip(),
-                    context,
+                    author_context,
                     recording_dir=recording_dir,
                     home=home,
                     on_progress=operation.on_progress,
@@ -1194,6 +1197,17 @@ def draft_recording_only(recording_key: str, body: RecordRecordingDraftOnlyReque
             candidate.workflow["review"] = candidate_review
             candidate.metadata["draft_revision"] = candidate_review["draft_revision"]
             candidate_review["source_digest"] = _recording_digest(recording_dir)
+            prepared = prepare_recording_build(
+                modules,
+                home=home,
+                profile_name=profile_name,
+                recording_dir=recording_dir,
+                workflow=candidate.workflow,
+            )
+            candidate.workflow["build"] = {
+                "build_dir": prepared["build_dir"],
+                "review_envelope_sha256": prepared["review_envelope_sha256"],
+            }
             next_digest = workflow_digest(candidate.workflow)
 
             conversation_to_publish: dict[str, Any] | None = None
@@ -1242,30 +1256,33 @@ def draft_recording_only(recording_key: str, body: RecordRecordingDraftOnlyReque
                 temporary.unlink(missing_ok=True)
             operation.ensure_terminal()
 
-    worker = threading.Thread(
-        target=run_draft,
-        daemon=True,
-        name=f"record-draft-{operation.operation_id[:8]}",
-    )
-    operation.attach_worker(worker)
-    try:
-        worker.start()
-    except BaseException as exc:
-        operation.fail(exc)
-        log.exception("Could not start Record drafting worker")
-    else:
-        operation.mark_worker_started()
+    def launch_worker() -> None:
+        worker = threading.Thread(
+            target=run_draft,
+            daemon=True,
+            name=f"record-draft-{operation.operation_id[:8]}",
+        )
+        operation.attach_worker(worker)
         try:
-            threading.Thread(
-                target=_watch_draft_operation,
-                args=(operation,),
-                daemon=True,
-                name=f"record-watch-{operation.operation_id[:8]}",
-            ).start()
-        except BaseException:
-            # Status polling also reconciles this operation; failure to create
-            # the convenience watcher must not invalidate a live worker.
-            log.exception("Could not start Record drafting watchdog")
+            worker.start()
+        except BaseException as exc:
+            operation.fail(exc)
+            log.exception("Could not start Record drafting worker")
+        else:
+            operation.mark_worker_started()
+
+    launch_worker()
+    try:
+        threading.Thread(
+            target=_watch_draft_operation,
+            args=(operation,),
+            daemon=True,
+            name=f"record-watch-{operation.operation_id[:8]}",
+        ).start()
+    except BaseException:
+        # Status polling also reconciles this operation; failure to create the
+        # convenience watcher must not invalidate a live worker.
+        log.exception("Could not start Record drafting watchdog")
     return _draft_operation_payload(operation)
 
 
@@ -1317,7 +1334,6 @@ def set_recording_as_hermes_job(body: RecordSetJobRequest):
             profile_name=profile_name,
             home=home,
             recording_dir=recording_dir,
-            publish_current_build=True,
         )
 
 
@@ -1328,7 +1344,6 @@ def _schedule_recording_locked(
     profile_name: str,
     home: Path,
     recording_dir: Path,
-    publish_current_build: bool = False,
 ):
     if _draft_operation_active(recording_dir):
         raise HTTPException(status_code=409, detail="A draft operation is already in progress.")
@@ -1353,6 +1368,17 @@ def _schedule_recording_locked(
     if state != "ready_to_schedule":
         raise HTTPException(status_code=409, detail="Finish the workflow review before setting this job.")
 
+    if run_mode == "webhook":
+        trigger = workflow.get("trigger") if isinstance(workflow.get("trigger"), dict) else {}
+        if trigger.get("feasibility") != "supported":
+            raise HTTPException(
+                status_code=409,
+                detail=str(
+                    trigger.get("reason")
+                    or "This recording does not contain a supported Hermes webhook trigger."
+                ),
+            )
+
     if run_mode == "webhook" and body.publish:
         try:
             webhook_status = modules["hermes"].webhook_runtime_status(
@@ -1370,7 +1396,7 @@ def _schedule_recording_locked(
             )
 
     try:
-        draft = compile_reviewed_recording(
+        draft = load_recording_build(
             modules,
             home=home,
             profile_name=profile_name,
@@ -1382,7 +1408,7 @@ def _schedule_recording_locked(
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("Record recording schedule failed during draft")
+        log.exception("Record could not load the reviewed Hermes job build")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     response = dict(draft)
     response["install"] = None
@@ -1390,18 +1416,9 @@ def _schedule_recording_locked(
         response["run_mode"] = run_mode
         response["status"] = "review_ready"
         return response
-    expected_review_envelope_sha256 = (
-        str(draft.get("review_envelope_sha256") or "")
-        if publish_current_build
-        else str(body.expected_review_envelope_sha256 or "")
+    expected_review_envelope_sha256 = str(
+        draft.get("review_envelope_sha256") or ""
     )
-    if expected_review_envelope_sha256 != draft.get(
-        "review_envelope_sha256"
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="The executable payload changed. Review the new setup.",
-        )
     try:
         install = publish_record_build(
             modules,

@@ -30,24 +30,17 @@ def _load_plugin_module(relative_name: str):
 
 def _plan(trigger):
     return {
-        "selection_reason": "Use the reviewed native execution.",
-        "state_strategy": "not_required",
-        "idempotency_strategy": "Deduplicate by webhook delivery id.",
-        "steps": ["Handle the paid invoice and verify the result."],
+        "steps": ["Handle the paid invoice.", "Verify the result."],
         "trigger": trigger,
-        "execution": {
+        "job_spec": {
+            "name": "Handle paid invoice",
+            "schedule": "triggered",
+            "deliver": "local",
             "no_agent": False,
-            "script": None,
             "prompt": "Use the current signed event payload and verify the result.",
             "skills": [],
-            "enabled_toolsets": [],
-            "requirements": {
-                "commands": [],
-                "network_origins": [],
-                "apps": [],
-                "files": [],
-            },
         },
+        "script_source": None,
         "warnings": [],
     }
 

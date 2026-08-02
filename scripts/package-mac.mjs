@@ -5,9 +5,10 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { runtimeFiles } from './runtime-files.mjs'
+import { runtimeFiles, validateRuntimeFiles } from './runtime-files.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+validateRuntimeFiles(repoRoot)
 const finalOutputRoot = path.join(repoRoot, 'dist', 'macos-arm64')
 const outputRoot = path.join(
   repoRoot,

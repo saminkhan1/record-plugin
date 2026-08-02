@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
 import uuid
@@ -13,17 +14,18 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_plugin_api():
-    module_name = f"record_plugin_api_test_{uuid.uuid4().hex}"
+    package_name = f"record_plugin_api_test_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(
-        module_name,
-        PLUGIN_ROOT / "dashboard" / "plugin_api.py",
+        package_name,
+        PLUGIN_ROOT / "__init__.py",
+        submodule_search_locations=[str(PLUGIN_ROOT)],
     )
     if spec is None or spec.loader is None:
         raise ImportError("Could not load Record plugin API")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    sys.modules[package_name] = module
     spec.loader.exec_module(module)
-    return module
+    return importlib.import_module(f"{package_name}.dashboard.plugin_api")
 
 
 def _authorization_request(api):

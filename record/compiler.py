@@ -4,10 +4,22 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+)
+from pydantic.json_schema import SkipJsonSchema
+from hermes_cli.web_models import CronJobCreate
 
 from ..recording_bundle import write_json
 from .review_receipt import (
@@ -18,13 +30,6 @@ from .review_receipt import (
 from .evidence import capture_acceptance_blockers
 
 
-_DRAFT_FIELDS = {
-    "selection_reason", "state_strategy", "idempotency_strategy", "steps",
-    "execution", "warnings", "trigger",
-}
-_EXECUTION_FIELDS = {
-    "no_agent", "script", "prompt", "skills", "enabled_toolsets", "requirements",
-}
 _RECORDING_EVIDENCE_MARKERS = (
     "evidence-pack.json",
     "capture-manifest.json",
@@ -49,94 +54,179 @@ class CompileResult:
     payload: dict[str, Any]
 
 
-def validate_draft_plan(plan: Any) -> dict[str, Any]:
-    """Validate the one schedule-independent plan emitted by the drafter.
+NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
-    This is the single execution-shape contract shared by drafting and
-    compilation.  Scheduling and profile configuration deliberately stay out
-    of the model-authored object and are applied only after review.
+
+class _DraftContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class DraftScript(_DraftContract):
+    path: NonEmptyString
+    body: NonEmptyString
+
+
+class DraftJobSpec(CronJobCreate):
+    """The Hermes ``create_job`` arguments reviewed by the operator.
+
+    Hermes owns the field contract. Record only tightens extra-field handling
+    and makes its host-owned name/schedule optional in the drafting tool call.
     """
 
-    if not isinstance(plan, dict):
-        raise CompileError("Hermes cron drafter returned a non-object")
-    unsupported = sorted(set(plan) - _DRAFT_FIELDS)
-    if unsupported:
-        raise CompileError("Hermes cron drafter returned unsupported fields: " + ", ".join(unsupported))
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    execution = plan.get("execution")
-    if not isinstance(execution, dict):
-        raise CompileError("Hermes cron drafter must return an execution object")
-    unsupported = sorted(set(execution) - _EXECUTION_FIELDS)
-    if unsupported:
-        raise CompileError("execution contains unsupported fields: " + ", ".join(unsupported))
-    no_agent = execution.get("no_agent")
-    if not isinstance(no_agent, bool):
-        raise CompileError("execution.no_agent must be a boolean")
-
-    script = _draft_script(execution.get("script"))
-    prompt = _optional_text(execution.get("prompt"), "execution.prompt")
-    skills = _string_list(execution.get("skills"), "execution.skills")
-    toolsets = _string_list(
-        execution.get("enabled_toolsets"), "execution.enabled_toolsets"
+    schedule: str = ""
+    name: str = ""
+    enabled_toolsets: list[NonEmptyString] | None = Field(
+        default=None,
+        max_length=0,
     )
-    if toolsets:
-        raise CompileError(
-            "execution.enabled_toolsets must be empty; the selected Hermes "
-            "profile owns Cron tool configuration"
+
+
+class DraftWarning(_DraftContract):
+    kind: NonEmptyString
+    severity: Literal["info", "review"]
+    message: NonEmptyString
+    step: int | SkipJsonSchema[None] = Field(default=None, ge=1)
+    verify: NonEmptyString | SkipJsonSchema[None] = None
+
+
+class DraftTrigger(_DraftContract):
+    requested: bool
+    feasibility: Literal["not_requested", "supported", "unsupported"]
+    description: str
+    source: NonEmptyString | SkipJsonSchema[None] = None
+    events: list[NonEmptyString]
+    filters: (
+        dict[str, Any]
+        | list[dict[str, Any]]
+        | SkipJsonSchema[None]
+    ) = None
+    reason: NonEmptyString
+
+
+class DraftPlan(_DraftContract):
+    steps: list[NonEmptyString] = Field(min_length=1, max_length=6)
+    trigger: DraftTrigger | SkipJsonSchema[None] = None
+    job_spec: DraftJobSpec
+    script_source: DraftScript | SkipJsonSchema[None] = None
+    warnings: list[DraftWarning]
+
+
+def draft_submission_schema() -> dict[str, Any]:
+    """Return the tool schema generated from the canonical draft contract."""
+
+    plan_schema = _inline_contract_schema(
+        DraftPlan.model_json_schema(mode="validation")
+    )
+    return {
+        "type": "object",
+        "properties": {"plan": plan_schema},
+        "required": ["plan"],
+        "additionalProperties": False,
+    }
+
+
+def _inline_contract_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline Pydantic definitions for Hermes' cross-provider tool subset."""
+
+    definitions = schema.pop("$defs", {})
+
+    def resolve(node: Any, stack: tuple[str, ...] = ()) -> Any:
+        if isinstance(node, list):
+            return [resolve(item, stack) for item in node]
+        if not isinstance(node, dict):
+            return node
+        reference = node.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            name = reference.removeprefix("#/$defs/")
+            if name in stack or name not in definitions:
+                raise RuntimeError(f"Cannot inline draft schema reference: {reference}")
+            siblings = {key: value for key, value in node.items() if key != "$ref"}
+            return {
+                **resolve(definitions[name], (*stack, name)),
+                **resolve(siblings, stack),
+            }
+        return {key: resolve(value, stack) for key, value in node.items()}
+
+    return resolve(schema)
+
+
+def _contract_error(subject: str, exc: ValidationError) -> CompileError:
+    details = []
+    for error in exc.errors(include_input=False, include_url=False):
+        location = ".".join(str(item) for item in error["loc"])
+        details.append(f"{location}: {error['msg']}" if location else error["msg"])
+    return CompileError(f"{subject} violates the Record draft contract: " + "; ".join(details))
+
+
+def validate_draft_plan(
+    plan: Any,
+    *,
+    job_defaults: dict[str, str] | None = None,
+    script_namespace: str = "",
+) -> dict[str, Any]:
+    """Return one complete, compiler-safe Hermes job proposal.
+
+    Raw model data crosses exactly one typed boundary here. Record injects the
+    immutable values it already owns and stores the resulting ``job_spec`` as
+    the authority used for both review and publication.
+    """
+
+    try:
+        contract = DraftPlan.model_validate(plan)
+    except ValidationError as exc:
+        raise _contract_error("Draft", exc) from exc
+
+    plan = contract.model_dump(mode="python")
+    job_spec = dict(plan["job_spec"])
+    for key, value in (job_defaults or {}).items():
+        if key in {"name", "schedule", "deliver"}:
+            job_spec[key] = str(value or "").strip()
+
+    script_source = _draft_script(plan.get("script_source"))
+    if script_source is None:
+        job_spec["script"] = None
+    else:
+        namespace = _safe_relative_path(script_namespace, "script namespace")
+        source_path = _safe_relative_path(
+            script_source["path"],
+            "script_source.path",
         )
+        job_spec["script"] = (namespace / source_path).as_posix()
+
+    job_spec = validate_job_spec(job_spec)
+    no_agent = job_spec["no_agent"]
+    prompt = _optional_text(job_spec.get("prompt"), "job_spec.prompt")
+    skills = _string_list(job_spec.get("skills"), "job_spec.skills")
+    toolsets = _string_list(
+        job_spec.get("enabled_toolsets"),
+        "job_spec.enabled_toolsets",
+    )
 
     if no_agent:
-        if script is None:
-            raise CompileError("No-agent execution requires execution.script")
+        if script_source is None:
+            raise CompileError("No-agent jobs require script_source")
         if prompt or skills or toolsets:
             raise CompileError(
-                "No-agent execution cannot include prompt, skills, or enabled_toolsets"
+                "No-agent jobs cannot include prompt, skills, or enabled_toolsets"
             )
-        llm_policy = "never"
     else:
         if prompt is None:
-            raise CompileError("Agent execution requires execution.prompt")
-        llm_policy = "on_change" if script is not None else "every_run"
+            raise CompileError("Agent jobs require job_spec.prompt")
 
-    requirements = execution.get("requirements")
-    if not isinstance(requirements, dict):
-        raise CompileError("execution.requirements must be an object")
-    normalized_requirements = {
-        key: _string_list(requirements.get(key), f"execution.requirements.{key}")
-        for key in ("commands", "network_origins", "apps", "files")
-    }
-    _reject_recording_evidence_runtime_references(prompt=prompt, script=script)
+    _reject_recording_evidence_runtime_references(
+        prompt=prompt,
+        script=script_source,
+    )
     steps = _draft_steps(plan.get("steps"))
 
-    warnings = plan.get("warnings") or []
-    if isinstance(warnings, str):
-        warnings = [warnings]
-    if not isinstance(warnings, list):
-        raise CompileError("warnings must be a list")
+    warnings = plan["warnings"]
     normalized_warnings: list[dict[str, Any]] = []
     for warning in warnings:
-        if isinstance(warning, str) and warning.strip():
-            normalized_warnings.append({
-                "kind": "execution_warning",
-                "severity": "review",
-                "message": warning.strip(),
-                "requires_review_resolution": True,
-            })
-            continue
-        if not isinstance(warning, dict):
-            raise CompileError("warnings entries must be non-empty strings or objects")
-        message = str(warning.get("message") or "").strip()
-        if not message:
-            raise CompileError("warnings entries require a non-empty message")
-        severity = str(warning.get("severity") or "review").strip().lower()
-        if severity not in {"info", "review", "blocking"}:
-            raise CompileError("warnings severity must be info, review, or blocking")
-        requires_resolution = warning.get("requires_review_resolution")
-        if requires_resolution is None:
-            requires_resolution = severity in {"review", "blocking"}
-        if not isinstance(requires_resolution, bool):
-            raise CompileError("warnings requires_review_resolution must be a boolean")
-        kind = str(warning.get("kind") or "execution_warning").strip() or "execution_warning"
+        message = warning["message"]
+        severity = warning["severity"]
+        kind = warning["kind"]
         step = warning.get("step")
         verify = warning.get("verify")
         has_step = step is not None
@@ -158,12 +248,10 @@ def validate_draft_plan(plan: Any) -> dict[str, Any]:
             ):
                 continue
             severity = "info"
-            requires_resolution = False
         normalized_warning = {
             "kind": kind,
             "severity": severity,
             "message": message,
-            "requires_review_resolution": requires_resolution,
         }
         if kind == "capture_quality_gap" and has_step:
             normalized_warning["step"] = step
@@ -171,20 +259,10 @@ def validate_draft_plan(plan: Any) -> dict[str, Any]:
         normalized_warnings.append(normalized_warning)
 
     return {
-        "selection_reason": _required_str(plan, "selection_reason"),
-        "llm_policy": llm_policy,
-        "state_strategy": _required_str(plan, "state_strategy"),
-        "idempotency_strategy": _required_str(plan, "idempotency_strategy"),
         "steps": steps,
         "trigger": _draft_trigger(plan.get("trigger")),
-        "execution": {
-            "no_agent": no_agent,
-            "script": script,
-            "prompt": prompt,
-            "skills": skills,
-            "enabled_toolsets": toolsets,
-            "requirements": normalized_requirements,
-        },
+        "job_spec": job_spec,
+        "script_source": script_source,
         "warnings": normalized_warnings,
     }
 
@@ -281,14 +359,44 @@ def _draft_script(value: Any) -> dict[str, str] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise CompileError("execution.script must be an object or null")
-    path = _safe_relative_path(_required_str(value, "path"), "execution.script.path")
+        raise CompileError("script_source must be an object or null")
+    path = _safe_relative_path(_required_str(value, "path"), "script_source.path")
     if path.suffix.lower() not in {".py", ".sh", ".bash"}:
-        raise CompileError("execution.script.path must end in .py, .sh, or .bash")
+        raise CompileError("script_source.path must end in .py, .sh, or .bash")
     body = value.get("body")
     if not isinstance(body, str) or not body.strip():
-        raise CompileError("execution.script.body is required")
+        raise CompileError("script_source.body is required")
+    _validate_script_syntax(path, body)
     return {"path": path.as_posix(), "body": body}
+
+
+def _validate_script_syntax(path: Path, body: str) -> None:
+    """Parse a proposed script without executing it against a live system."""
+
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=path.suffix, encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            if path.suffix.lower() == ".py":
+                import py_compile
+
+                py_compile.compile(handle.name, doraise=True)
+            else:
+                completed = subprocess.run(
+                    ["bash", "-n", handle.name],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if completed.returncode:
+                    raise CompileError(
+                        "script_source has invalid shell syntax: "
+                        + (completed.stderr.strip() or "bash -n failed")
+                    )
+    except CompileError:
+        raise
+    except Exception as exc:
+        raise CompileError(f"script_source has invalid syntax: {exc}") from exc
 
 
 def _reject_recording_evidence_runtime_references(
@@ -303,18 +411,15 @@ def _reject_recording_evidence_runtime_references(
     leaked = next((marker for marker in _RECORDING_EVIDENCE_MARKERS if marker in lowered), None)
     if leaked:
         raise CompileError(
-            "execution must not reference local recording evidence at runtime: " + leaked
+            "job_spec must not reference local recording evidence at runtime: " + leaked
         )
 
 
 def review_blockers(workflow: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return unresolved model-authored execution blockers.
+    """Return only host-proven capture failures that prevent publication.
 
-    Recorder warnings describe evidence quality. They remain available to the
-    drafter and in review metadata, but their internal kind names do not have
-    authority to override a compiler-valid plan. A material ambiguity must be
-    represented by the plan as a blocking/explicit draft warning (or fail a
-    concrete compile/safety gate) before it can prevent scheduling.
+    Model-authored warnings are review information, never lifecycle gates. A
+    compiler-valid Hermes job proposal is always shown after a usable capture.
     """
 
     review = workflow.get("review") if isinstance(workflow.get("review"), dict) else {}
@@ -354,21 +459,6 @@ def review_blockers(workflow: dict[str, Any]) -> list[dict[str, Any]]:
                 message,
                 "rerecord",
             )
-    value = review.get("warnings")
-    for warning in value if isinstance(value, list) else []:
-        if isinstance(warning, str):
-            warning = {"kind": "execution_warning", "message": warning}
-        if not isinstance(warning, dict):
-            continue
-        kind = str(warning.get("kind") or "execution_warning").strip().lower()
-        message = str(warning.get("message") or "").strip()
-        severity = str(warning.get("severity") or "").strip().lower()
-        explicit = warning.get("requires_review_resolution") is True
-        if not kind or not message:
-            continue
-        if not (explicit or severity == "blocking" or kind == "browser_auth"):
-            continue
-        add(kind, message, "redraft")
     return blockers
 
 
@@ -388,6 +478,25 @@ def _optional_text(value: Any, field: str) -> str | None:
     if not isinstance(value, str):
         raise CompileError(f"{field} must be a string or null")
     return value.strip() or None
+
+
+def validate_job_spec(value: Any) -> dict[str, Any]:
+    """Validate the stored proposal with Hermes' maintained Cron request type."""
+
+    try:
+        canonical = DraftJobSpec.model_validate(value).model_dump(
+            mode="python",
+            exclude_none=True,
+        )
+    except ValidationError as exc:
+        raise _contract_error("Job specification", exc) from exc
+    if not str(canonical.get("name") or "").strip():
+        raise CompileError("job_spec.name is required")
+    if not str(canonical.get("schedule") or "").strip():
+        raise CompileError("job_spec.schedule is required")
+    if canonical.get("enabled_toolsets") == []:
+        canonical.pop("enabled_toolsets")
+    return canonical
 
 
 @dataclass
@@ -427,16 +536,31 @@ def compile_workflow(
     *,
     provenance: dict[str, Any] | None = None,
 ) -> CompileResult:
-    execution = normalize_workflow_execution(workflow)
-    no_agent = execution["no_agent"]
-    name = _required_str(workflow, "name")
-    workflow_scope = str(workflow.get("id") or name)
-    build_scope = f"{workflow_scope}\0{out_dir.expanduser().resolve().name}"
-    script_namespace = Path("record") / hashlib.sha256(
-        build_scope.encode("utf-8")
-    ).hexdigest()[:16]
-    schedule = _required_str(workflow, "schedule")
-    deliver = str(workflow.get("deliver") or "local")
+    job_spec = validate_job_spec(workflow.get("job_spec"))
+    no_agent = job_spec["no_agent"]
+    script_source = _draft_script(workflow.get("script_source"))
+    script_name = job_spec.get("script")
+    if bool(script_source) != bool(script_name):
+        raise CompileError(
+            "job_spec.script and script_source must either both be present or both be absent"
+        )
+    prompt = _optional_text(job_spec.get("prompt"), "job_spec.prompt")
+    skills = _string_list(job_spec.get("skills"), "job_spec.skills")
+    toolsets = _string_list(
+        job_spec.get("enabled_toolsets"),
+        "job_spec.enabled_toolsets",
+    )
+    if no_agent:
+        if not script_source or prompt or skills or toolsets:
+            raise CompileError(
+                "No-agent jobs require only script_source and cannot include prompt, skills, or enabled_toolsets"
+            )
+    elif prompt is None:
+        raise CompileError("Agent jobs require job_spec.prompt")
+    _reject_recording_evidence_runtime_references(
+        prompt=prompt,
+        script=script_source,
+    )
 
     out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -446,51 +570,18 @@ def compile_workflow(
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: list[dict[str, Any]] = []
-    payload: dict[str, Any] = {
-        "action": "create",
-        "name": name,
-        "schedule": schedule,
-        "deliver": deliver,
-        "prompt": None,
-        "skills": [],
-        "script": None,
-        "context_from": None,
-        "enabled_toolsets": None,
-        "workdir": None,
-    }
-    script_name: str | None = None
-    if no_agent:
-        if execution["prompt"] or execution["skills"] or execution["enabled_toolsets"]:
-            raise CompileError("no-agent execution cannot include prompt, skills, or enabled_toolsets")
-        script_name = _write_script(
-            execution.get("script"),
+    payload: dict[str, Any] = {"action": "create", **job_spec}
+    if script_source and isinstance(script_name, str):
+        written_name = _write_script(
+            script_source,
             scripts_dir,
             required=True,
-            destination_prefix=script_namespace,
+            destination_prefix=None,
+            destination=script_name,
         )
-        if script_name is None:
-            raise CompileError("no-agent execution requires a script")
-        payload.update({"script": script_name, "no_agent": True})
+        if written_name != script_name:
+            raise CompileError("Staged script destination changed unexpectedly")
         artifacts.append(_script_artifact(script_name))
-    else:
-        skills = execution["skills"]
-        payload["skills"] = skills
-        prompt = execution.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise CompileError("execution.prompt is required for agent jobs")
-        payload["prompt"] = prompt.strip()
-        toolsets = execution["enabled_toolsets"]
-        payload["enabled_toolsets"] = toolsets or None
-        script_name = _write_script(
-            execution.get("script"),
-            scripts_dir,
-            required=False,
-            destination_prefix=script_namespace,
-        )
-        payload["script"] = script_name
-        if script_name:
-            artifacts.append(_script_artifact(script_name))
-        payload["no_agent"] = False
 
     write_artifact_manifest(out_dir, artifacts)
 
@@ -535,36 +626,6 @@ def compile_workflow(
     return CompileResult(payload=payload)
 
 
-def normalize_workflow_execution(workflow: dict[str, Any]) -> dict[str, Any]:
-    """Return the reviewed native cron execution fields."""
-
-    raw = workflow.get("execution")
-    if not isinstance(raw, dict):
-        raise CompileError("execution must be an object")
-    execution = dict(raw)
-    no_agent = execution.get("no_agent")
-    if not isinstance(no_agent, bool):
-        raise CompileError("execution.no_agent must be a boolean")
-    script = _draft_script(execution.get("script"))
-    execution["script"] = script
-    execution["prompt"] = _optional_text(
-        execution.get("prompt"),
-        "execution.prompt",
-    )
-    execution["skills"] = _string_list(execution.get("skills"), "execution.skills")
-    execution["enabled_toolsets"] = _string_list(
-        execution.get("enabled_toolsets"), "execution.enabled_toolsets"
-    )
-    _reject_recording_evidence_runtime_references(
-        prompt=execution["prompt"],
-        script=script,
-    )
-    unsupported = sorted(set(execution) - _EXECUTION_FIELDS)
-    if unsupported:
-        raise CompileError("execution contains unsupported fields: " + ", ".join(unsupported))
-    return execution
-
-
 def _required_str(mapping: dict[str, Any], key: str) -> str:
     value = mapping.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -587,23 +648,28 @@ def _write_script(
     *,
     required: bool,
     destination_prefix: Path | None = None,
+    destination: str | None = None,
 ) -> str | None:
     if script is None:
         if required:
-            raise CompileError("execution.script is required for no-agent jobs")
+            raise CompileError("script_source is required for no-agent jobs")
         return None
     if not isinstance(script, dict):
         raise CompileError("script must be an object")
     script_path = _safe_relative_path(_required_str(script, "path"), "script.path")
     body = script.get("body")
-    destination = (destination_prefix / script_path) if destination_prefix else script_path
-    target = scripts_dir / destination
+    final_path = (
+        _safe_relative_path(destination, "job_spec.script")
+        if destination is not None
+        else (destination_prefix / script_path if destination_prefix else script_path)
+    )
+    target = scripts_dir / final_path
     target.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(body, str):
         target.write_text(_ensure_trailing_newline(body), encoding="utf-8")
     else:
         raise CompileError("script requires body")
-    return destination.as_posix()
+    return final_path.as_posix()
 
 
 def _string_list(value: Any, field: str) -> list[str]:
@@ -702,7 +768,7 @@ def _review_markdown(
     lines = [
         f"# Review: {payload.get('name', 'Hermes cron job')}",
         "",
-        "Approve this build only after checking the schedule, script or prompt, skills, toolsets, prerequisites, and warnings.",
+        "This is the exact Hermes job that will be created when you approve it.",
         "",
         "Hermes stores and executes cron scripts from `HERMES_HOME/scripts/`. Use absolute paths inside no-agent scripts when artifacts must land outside that scripts directory.",
         "",
