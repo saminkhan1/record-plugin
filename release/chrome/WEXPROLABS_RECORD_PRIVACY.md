@@ -3,8 +3,8 @@
 Effective date: July 27, 2026
 
 This policy applies to the Record macOS application and the Record Chrome
-Provider extension (together, “Record”). Wexprolabs provides Hermes
-Record to organizations for use by their authorized employees and contractors.
+Provider extension (together, “Record”). Wexprolabs provides Record to
+organizations for use by their authorized employees and contractors.
 The customer organization may also be a controller of employee data under its
 agreement with Wexprolabs and its own workplace policies.
 
@@ -34,7 +34,7 @@ information, location, browsing history, user activity, or website content.
 
 The Chrome extension sends recording data only through Chrome Native Messaging
 to the Record application installed on the same Mac. Raw recording
-bundles are stored in the selected local Hermes profile. For crash recovery, the
+bundles are stored in the selected local Record profile. For crash recovery, the
 extension may temporarily keep a recording checkpoint and unsent action rows in
 Chrome local extension storage.
 
@@ -71,7 +71,7 @@ User Data Policy, including its Limited Use requirements.
 
 Local recording bundles, including dismissed recording evidence, workflow
 drafts, installed jobs, and local execution records remain in the selected
-Hermes profile until an authorized user or customer administrator permanently
+Record profile until an authorized user or customer administrator permanently
 deletes them or removes that profile. Dismissing a valid recording removes it
 from active review without automatically deleting its recovery evidence.
 Temporary Chrome checkpoints and acknowledged outbox rows are cleared when the

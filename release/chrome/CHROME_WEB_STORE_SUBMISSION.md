@@ -25,7 +25,9 @@ either identity, and never publish from this checklist.
 
 Name: `Record Chrome Provider`
 
-Description opening: `Record Chrome Provider works with the Hermes Mac application.`
+Description opening: `Record Chrome Provider works with the Record Mac application.`
+
+Homepage URL: `https://wexprolabs.com/workflow-automation/`
 
 Category: `Workflow & Planning`
 
@@ -33,9 +35,9 @@ Language: `English (United States)`
 
 Detailed description:
 
-> Record Chrome Provider works with the Hermes Mac application. Its single
+> Record Chrome Provider works with the Record Mac application. Its single
 > purpose is to capture a user's Chrome actions and visual evidence only while a
-> local Record recording is active, so Hermes can create a workflow draft
+> local Record recording is active, so Record can create a workflow draft
 > for the user to review.
 >
 > During an active recording, the extension captures active-page URLs and
@@ -48,19 +50,19 @@ Detailed description:
 >
 > For crash recovery, the extension may temporarily store a recording checkpoint
 > and unsent action rows in Chrome's local extension storage. It transfers
-> recording data through Chrome Native Messaging to the Hermes native application
+> recording data through Chrome Native Messaging to the Record native application
 > installed on this Mac. Recording bundles are stored in the selected local
-> Hermes profile. Bounded recording evidence may be processed by the user's
+> Record profile. Bounded recording evidence may be processed by the user's
 > configured model to create the draft, and execution traces are exported to the
 > user's configured Langfuse service, as described in the product privacy policy.
 >
-> The extension has no standalone function without the local Hermes Mac
+> The extension has no standalone function without the local Record Mac
 > application.
 
 Single purpose:
 
-> Capture a user's Chrome actions and visual evidence only while a local Hermes
-> Record recording is active, so Hermes can create a workflow draft for the user
+> Capture a user's Chrome actions and visual evidence only while a local Record
+> recording is active, so Record can create a workflow draft for the user
 > to review.
 
 Prominent data disclosure:
@@ -71,7 +73,7 @@ Prominent data disclosure:
 > context, and visible-tab screenshots. Password-field values are redacted.
 > The extension may temporarily retain a recording checkpoint and unsent action
 > rows in Chrome's local extension storage for crash recovery. It sends
-> recording data only to the Hermes native application installed on this Mac.
+> recording data only to the Record native application installed on this Mac.
 
 Do not add claims about retention, encryption, support, pricing, availability,
 or remote data handling unless product/legal has supplied and verified them.
@@ -96,12 +98,12 @@ or remote data handling unless product/legal has supplied and verified them.
 - Host access `<all_urls>`: workflows may cross arbitrary customer-selected
   sites and frames. Local `file://` pages require the user to enable Chrome's
   separate **Allow access to file URLs** setting. Capture is persisted only
-  while Hermes reports an active recording; Chrome-restricted pages remain
+  while Record reports an active recording; Chrome-restricted pages remain
   inaccessible.
 
 The extension source has no direct HTTP, WebSocket, or analytics client. Its
 transfer boundary is `chrome.runtime.connectNative("com.hermes.chrome_capture")`;
-the native Hermes product owns any later storage or processing. The extension
+the native Record product owns any later storage or processing. The extension
 listing describes that local extension-to-native boundary; the product privacy
 policy separately describes configured-model drafting and configured-Langfuse
 trace export.
@@ -132,7 +134,7 @@ before saving the Privacy page rather than supplying a remote-code justification
   events. Those payloads can contain any of the nine categories. Password-field
   redaction alone is not a defensible basis for marking another category absent.
 - [x] Paste each permission justification without weakening its scope.
-- [ ] Certify Limited Use only after product/legal verifies that actual Hermes
+- [ ] Certify Limited Use only after product/legal verifies that actual Record
       handling complies with every certification shown in the dashboard.
 - [x] Provide the Wexprolabs Record privacy-policy URL describing
       collection, use, transfer to the local native application, configured-model
@@ -170,9 +172,9 @@ substitute for runtime evidence.
 
 - [ ] Add the intended tester Google accounts in Publisher settings.
 - [ ] Select `Private` and `Only trusted testers from the current publisher`.
-- [ ] Confirm the name is `Record Chrome Provider` and the description opens
-      with `Record Chrome Provider works with the Hermes Mac application`.
-- [ ] Provide reviewer instructions for starting/stopping a local Hermes
+- [x] Confirm the name is `Record Chrome Provider` and the description opens
+      with `Record Chrome Provider works with the Record Mac application`.
+- [ ] Provide reviewer instructions for starting/stopping a local Record
       recording and exercising the extension. Supply test credentials only through
       the dashboard's protected field when they are actually needed.
 
@@ -180,7 +182,7 @@ substitute for runtime evidence.
   signed/notarized download):
 
   > Requires the signed/notarized Record macOS application. Install and launch
-  > Hermes once, then open Workflows in Hermes Desktop. Start a recording, visit
+  > Record once, then open Workflows in Record Desktop. Start a recording, visit
   > a public HTTPS page, click or type non-sensitive test text, stop the
   > recording, and verify that a workflow draft appears. The extension popup
   > should show its local native-host connection. No Web Store login is required.
@@ -190,7 +192,7 @@ substitute for runtime evidence.
       Private items have the same policy review requirements as public items.
 - [ ] After approval, publish to trusted testers from the dashboard.
 - [ ] On a clean physical Mac, sign Chrome into an allowlisted tester account,
-      launch the signed/notarized Hermes app once, install/enable the store
+      launch the signed/notarized Record app once, install/enable the store
       extension, and confirm `chrome://extensions` shows the exact assigned ID in
       `store-identity.json` and version `0.2.1`.
 - [ ] If local-file workflows are part of the release, enable **Allow access to
