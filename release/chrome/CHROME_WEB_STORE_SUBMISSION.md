@@ -1,6 +1,6 @@
 # Record Chrome Provider submission
 
-This is the reviewed submission inventory for extension version `0.2.1`. It is
+This is the reviewed submission inventory for extension version `0.2.2`. It is
 an operator checklist, not authorization to create or publish a Chrome Web Store
 item.
 
@@ -10,10 +10,10 @@ item.
       `saminbbkhan` accepted the first draft item.
 - [x] The assigned Item ID and dashboard public key are bound in the manifest and
       `store-identity.json`; the packaging gate derives and verifies the same ID.
-- [ ] Run `npm test` and `npm run package:chrome`, then upload
-      `dist/chrome/hermes-chrome-provider-0.2.1.zip` to the existing draft item.
+- [x] Run `npm test` and `npm run package:chrome`, then upload
+      `dist/chrome/hermes-chrome-provider-0.2.2.zip` to the existing draft item.
       Do not create a replacement item.
-- [ ] Compare `dist/chrome/package-receipt.json` with the reviewed source and
+- [x] Compare `dist/chrome/package-receipt.json` with the reviewed source and
       commit before building the signed Mac release.
 
 The assigned Chrome Web Store Item ID is
@@ -156,8 +156,8 @@ before saving the Privacy page rather than supplying a remote-code justification
 
 - [x] Package icon: `icons/icon128.png`, deterministic 128x128 PNG derived from
       the desktop app icon.
-- [ ] At least one real 1280x800 workflow-recording screenshot with no customer
-      data. **External blocker: capture and approve the final signed UI.**
+- [x] At least one approved 1280x800 workflow-review screenshot with no customer
+      data is uploaded as `cws-assets/workflow-review-screenshot.png`.
 - [x] Optional small promotional tile prepared at
       `release/chrome/cws-assets/small-promo-tile.png`. It is a 440x280,
       8-bit-per-channel RGB PNG without alpha. Product approval is still required
@@ -194,7 +194,7 @@ substitute for runtime evidence.
 - [ ] On a clean physical Mac, sign Chrome into an allowlisted tester account,
       launch the signed/notarized Record app once, install/enable the store
       extension, and confirm `chrome://extensions` shows the exact assigned ID in
-      `store-identity.json` and version `0.2.1`.
+      `store-identity.json` and version `0.2.2`.
 - [ ] If local-file workflows are part of the release, enable **Allow access to
       file URLs** in the extension details and verify one non-sensitive
       `file://` recording. Do not claim local-file capture without that setting.
