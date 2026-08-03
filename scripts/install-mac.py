@@ -185,9 +185,7 @@ def _run(
     return result
 
 
-def _recorder_build_manifest(
-    root: Path, *, allow_legacy: bool = False
-) -> dict[str, Any] | None:
+def _recorder_build_manifest(root: Path) -> dict[str, Any] | None:
     manifest = _read_json(root / "recorder-manifest.json")
     if not manifest:
         return None
@@ -201,12 +199,8 @@ def _recorder_build_manifest(
         else {}
     )
     if (
-        schema_version not in {1, 2}
-        or (not allow_legacy and schema_version != 2)
-        or (
-            schema_version == 2
-            and manifest.get("product") != "record"
-        )
+        schema_version != 2
+        or manifest.get("product") != "record"
         or manifest.get("platform") != "darwin"
         or manifest.get("arch") != "arm64"
         or not isinstance(manifest.get("teamId"), str)
@@ -700,7 +694,11 @@ def _hermes_root_for_home(hermes_home: Path) -> Path:
 
 def _resolve_managed_python(explicit: str | None, hermes_root: Path) -> Path:
     candidates = (
-        [Path(explicit).expanduser().resolve()]
+        # Preserve the managed-runtime entrypoint instead of resolving its
+        # symlink. uv-backed Hermes environments use the symlink path to
+        # select the venv's site-packages; probing the real interpreter path
+        # would incorrectly fall back to the base runtime.
+        [Path(explicit).expanduser()]
         if explicit
         else [hermes_root / "hermes-agent" / "venv" / "bin" / "python"]
     )
@@ -916,9 +914,6 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
     python_target = hermes_home / "plugins" / PLUGIN_NAME
     desktop_target = desktop_home / "desktop-plugins" / PLUGIN_NAME
     recorder_target = hermes_root / "record" / "native-recorder"
-    legacy_profile_recorder = (
-        python_target / "native" / "hermes-recorder"
-    )
     receipt_path = hermes_home / "record" / "installation.json"
 
     recorder_target_state = None
@@ -1055,11 +1050,6 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
     prepared: list[PreparedDirectory] = []
     committed: list[PreparedDirectory] = []
     recorder_prepared: PreparedDirectory | None = None
-    legacy_recorder_owned = _recorder_build_manifest(
-        legacy_profile_recorder,
-        allow_legacy=True,
-    )
-    legacy_recorder_unregistered = False
     removed_recorder_registrations: list[Path] = []
     installation_receipt: dict[str, Any] | None = None
 
@@ -1079,11 +1069,6 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
             prepared.append(
                 _prepare_directory(desktop_source, desktop_target)
             )
-        if legacy_recorder_owned:
-            # Treat the registration as rollback-owned before calling
-            # lsregister because it may update state before returning an error.
-            legacy_recorder_unregistered = True
-            _unregister_recorder(legacy_profile_recorder)
         for item in prepared:
             _commit_directory(item)
             committed.append(item)
@@ -1223,11 +1208,6 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
             attempt(
                 f"register restored {recorder_target}",
                 lambda: _register_recorder(recorder_target),
-            )
-        if legacy_recorder_unregistered and legacy_profile_recorder.exists():
-            attempt(
-                f"register restored {legacy_profile_recorder}",
-                lambda: _register_recorder(legacy_profile_recorder),
             )
         for app in removed_recorder_registrations:
             if app.exists():
