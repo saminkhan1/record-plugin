@@ -119,7 +119,7 @@ backend and does not copy or bundle Hermes.
   dispatch;
 - Node.js 20 or newer and Apple's Swift toolchain to build locally;
 - one stable macOS code-signing identity;
-- Google Chrome and the published Hermes Chrome Provider Web Store extension
+- Google Chrome and the published Record Chrome Provider Web Store extension
   for customer installation;
 - Accessibility, Screen Recording, and Input Monitoring permission for the
   signed Hermes Recorder Service identity.
@@ -354,17 +354,12 @@ Desktop supports both time-backed and event-backed jobs. Record does not add a
 second receiver: it installs a reviewed dynamic subscription into Hermes'
 profile-scoped, HMAC-authenticated
 [webhook surface](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks).
-Matching deliveries are queued as input for the durable Cron job, which uses
-the host's `triggered` schedule extension and returns to an awaiting-event
-state after each run.
-
-The distinction is intentional. Stock Hermes documentation describes
-[Cron](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron) as
-time-based and webhook routes as agent-run ingress. Binding a dynamic webhook
-subscription directly to an existing reviewed Cron job is a required Hermes
-host capability for this distribution, not a second Record scheduler or an
-upstream API claim. Desktop reports the selected profile's receiver readiness
-and refuses activation until its public URL and gateway are live.
+Matching deliveries use Hermes' native event filtering, replay protection,
+payload templating, skill loading, agent sessions, and delivery behavior.
+[Cron](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
+continues to own only time-backed workflows. Desktop reports the selected
+profile's receiver readiness and refuses activation until the gateway's
+webhook receiver is live.
 
 ## Runtime data
 

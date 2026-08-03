@@ -548,10 +548,9 @@ def _require_customer_distribution(
     )
     client = package_root / manifest["recorderClient"]
     service_app = _recorder_service_app(client.parent)
-    _run(
-        "/usr/sbin/spctl",
-        ["--assess", "--type", "execute", "--verbose=4", str(client)],
-    )
+    # Gatekeeper assesses the distributable application bundles. The raw
+    # recorder client is already verified as a hardened-runtime, timestamped,
+    # team-matched Mach-O in _load_package_manifest.
     _run(
         "/usr/sbin/spctl",
         [

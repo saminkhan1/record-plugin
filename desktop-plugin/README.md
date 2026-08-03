@@ -67,8 +67,8 @@ these Desktop-only adapter calls:
 - `GET /webhook-status`
 - `POST /recordings/set-job`
 
-`set-job` validates the reviewed digest and delegates job persistence and
-execution to Hermes Cron. For webhook mode it also requires the active
-profile's Hermes receiver to be ready, installs one signed dynamic subscription,
-and returns its URL and one-time signing secret. The receipt stores only
+`set-job` validates the reviewed digest. Scheduled workflows delegate
+persistence and execution to Hermes Cron. Webhook workflows require the active
+profile's Hermes receiver to be ready, install one native signed dynamic
+subscription, and return its URL and signing secret. The receipt stores only
 non-secret route metadata.

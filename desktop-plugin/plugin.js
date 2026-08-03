@@ -455,26 +455,20 @@ function WorkflowForm({ form, setForm, busy, onStart }) {
   }
 
   return element(
-    Panel,
+    'form',
     {
-      title: t('new.title'),
-      description: t('new.description')
-    },
-    element(
-      'form',
-      {
-        className: 'flex flex-col gap-4',
-        onSubmit: event => {
-          event.preventDefault()
+      className: 'flex flex-col gap-4',
+      onSubmit: event => {
+        event.preventDefault()
 
-          if (busy || Object.keys(validate()).length) {
-            return
-          }
-
-          void onStart()
+        if (busy || Object.keys(validate()).length) {
+          return
         }
-      },
-      [
+
+        void onStart()
+      }
+    },
+    [
         element(
           Field,
           {
@@ -572,9 +566,8 @@ function WorkflowForm({ form, setForm, busy, onStart }) {
             },
             busy === 'start' ? t('new.starting') : t('new.start')
           )
-        ])
-      ]
-    )
+      ])
+    ]
   )
 }
 
@@ -1009,14 +1002,16 @@ function InstalledJob({ installed, onNew }) {
           },
           t('installed.new')
         ),
-        element(
-          Button,
-          {
-            key: 'cron',
-            onClick: () => host.navigate('/cron')
-          },
-          t('installed.manage')
-        )
+        webhook
+          ? null
+          : element(
+              Button,
+              {
+                key: 'cron',
+                onClick: () => host.navigate('/cron')
+              },
+              t('installed.manage')
+            )
       ])
     ])
   )
@@ -1105,14 +1100,11 @@ function RecordProfilePage({ client, profile }) {
     setForm(current => ({
       name: String(recording.name || current.name),
       instructions: String(recording.instructions || current.instructions),
-      schedule:
-        recording.schedule && recording.schedule !== 'triggered'
-          ? String(recording.schedule)
-          : current.schedule,
+      schedule: recording.schedule
+        ? String(recording.schedule)
+        : current.schedule,
       runMode:
-        recording.run_mode === 'webhook' || recording.schedule === 'triggered'
-          ? 'webhook'
-          : current.runMode
+        recording.run_mode === 'webhook' ? 'webhook' : current.runMode
     }))
   }, [key])
 
@@ -1477,7 +1469,7 @@ export default {
         page: {
           title: 'Workflows',
           description:
-            'Describe the result and how it starts, then show Hermes the work once.',
+            'Turn recurring computer work into workflows you can review and run.',
           loading: 'Loading workflows'
         },
         status: {
@@ -1488,15 +1480,13 @@ export default {
           open: 'Open Record workflows'
         },
         new: {
-          title: '1. Define and record',
-          description: 'Give Hermes the intent it needs to draft the workflow, then perform the task normally.',
           name: 'Workflow name',
           namePlaceholder: 'Daily vendor status brief',
-          instructions: 'What should Hermes reproduce?',
-          instructionsHint: 'State the intended result and any limits Hermes must keep.',
-          instructionsPlaceholder: 'Open the vendor portal, collect the latest status, and prepare the same brief…',
+          instructions: 'What result should Hermes produce?',
+          instructionsHint: 'Describe what a successful run must complete or verify, including any limits.',
+          instructionsPlaceholder: 'Prepare a current vendor status brief and flag any missing updates…',
           schedule: 'Schedule',
-          scheduleHint: 'Choose when Hermes should run this workflow.',
+          scheduleHint: 'Choose when this workflow should run.',
           start: 'Start recording',
           starting: 'Preparing recorder…'
         },
@@ -1504,7 +1494,7 @@ export default {
           label: 'How should this workflow start?',
           schedule: 'On a schedule',
           webhook: 'When an event happens',
-          eventHint: 'Include the exact event in the result above. Hermes will identify the source, filters, and support while drafting.',
+          eventHint: 'Include the event that should start the workflow. Hermes will identify its source and filters while drafting.',
           webhookTitle: 'Event start',
           webhookDescription: 'Hermes will verify the drafted event before this workflow can be turned on.',
           detected: 'Event supported',
@@ -1518,7 +1508,7 @@ export default {
           activeTitle: 'Recording your workflow',
           activeDescription: 'Do the task once as you normally would, then return here.',
           savedTitle: 'Recording saved',
-          savedDescription: 'The capture is sealed and ready for Hermes to draft.',
+          savedDescription: 'Hermes is ready to turn this recording into a workflow draft.',
           drafting: 'Hermes is drafting the workflow…',
           discard: 'Discard recording',
           discardTitle: 'Discard this recording?',
@@ -1526,12 +1516,12 @@ export default {
           discardConfirm: 'Discard recording',
           discarding: 'Discarding…',
           cancelDraft: 'Cancel drafting',
-          stopAndDraft: 'Stop and draft',
+          stopAndDraft: 'Finish and create draft',
           retryDraft: 'Retry draft'
         },
         review: {
           title: 'Review your workflow',
-          description: 'Check what Hermes will do and resolve any unclear detail before turning it on.',
+          description: 'Review the execution steps and anything that needs you, then turn on the workflow.',
           ready: 'ready',
           checking: 'checking',
           states: {
@@ -1541,7 +1531,7 @@ export default {
             ready_to_schedule: 'ready'
           },
           steps: 'Execution steps',
-          noSteps: 'Hermes did not return a readable step list. Ask Hermes to update the draft.',
+          noSteps: 'No execution steps are available. Ask Hermes to update the draft.',
           needsAttention: 'Needs attention',
           starts: 'Starts',
           conversation: 'Ask Hermes a question or request a change',
@@ -1558,13 +1548,13 @@ export default {
         },
         installed: {
           title: 'Workflow is on',
-          description: 'Hermes Cron owns the schedule, execution sessions, and run history.',
-          webhookJobDescription: 'Hermes Cron owns the durable job, queued events, execution sessions, and run history.',
+          description: 'This workflow will run on the schedule you reviewed.',
+          webhookJobDescription: 'This workflow will start when a matching, verified event arrives.',
           active: 'active',
           awaitingEvent: 'awaiting event',
           jobId: 'Job ID',
           webhookReady: 'Webhook endpoint ready',
-          webhookDescription: 'Send signed event payloads to this URL. Matching events queue the reviewed job; non-matching or invalid requests are rejected.',
+          webhookDescription: 'Send signed event payloads to this URL. Matching events start the reviewed workflow; non-matching or invalid requests are rejected.',
           copyUrl: 'Copy webhook URL',
           signingSecret: 'Show signing secret',
           secretWarning: 'Store this secret in the sending system. Hermes uses it to verify each request.',
@@ -1574,11 +1564,11 @@ export default {
         },
         errors: {
           nameRequired: 'Enter a workflow name.',
-          instructionsRequired: 'Describe what Hermes should reproduce.',
-          scheduleRequired: 'Enter a Cron schedule.',
+          instructionsRequired: 'Describe the result this workflow should produce.',
+          scheduleRequired: 'Choose when this workflow should run.',
           draftCanceled: 'Workflow drafting was canceled.',
-          draftFailed: 'Workflow drafting failed. Retry when the recorder and model are available.',
-          jobRejected: 'Hermes Cron rejected this job.'
+          draftFailed: 'Unable to create the workflow draft. Check that Hermes is ready, then try again.',
+          jobRejected: 'Unable to turn on this workflow. Review the details and try again.'
         }
       }
     })

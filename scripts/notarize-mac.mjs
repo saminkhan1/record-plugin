@@ -521,7 +521,9 @@ try {
     stagedInstallerApp
   ])
   run('/usr/sbin/spctl', ['--assess', '--type', 'execute', '--verbose=4', stagedInstallerApp])
-  run('/usr/sbin/spctl', ['--assess', '--type', 'execute', '--verbose=4', recorderClient])
+  // Gatekeeper assesses distributable app bundles, not standalone Mach-O
+  // command-line tools. The recorder client is covered by the package's
+  // hardened-runtime codesign and immutable payload checks above.
   run('/usr/sbin/spctl', ['--assess', '--type', 'execute', '--verbose=4', recorderService])
   requireSameInventory(
     authorizedInventory,

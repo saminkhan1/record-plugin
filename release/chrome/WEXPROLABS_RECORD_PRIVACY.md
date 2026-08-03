@@ -1,9 +1,9 @@
-# Wexprolabs Record Beta Privacy Policy
+# Wexprolabs Record Privacy Policy
 
 Effective date: July 27, 2026
 
-This policy applies to the Record macOS beta and the Hermes Chrome
-Provider BETA extension (together, “Record”). Wexprolabs provides Hermes
+This policy applies to the Record macOS application and the Record Chrome
+Provider extension (together, “Record”). Wexprolabs provides Hermes
 Record to organizations for use by their authorized employees and contractors.
 The customer organization may also be a controller of employee data under its
 agreement with Wexprolabs and its own workplace policies.
@@ -78,10 +78,10 @@ Temporary Chrome checkpoints and acknowledged outbox rows are cleared when the
 recording is finalized or dismissed.
 
 Retention and deletion for a configured model or Langfuse endpoint are
-controlled by the customer organization’s provider account and beta agreement.
+controlled by the customer organization’s provider account and customer agreement.
 Wexprolabs does not create an additional remote telemetry copy. A customer can
 stop further remote processing by removing the configured endpoint credentials
-and can request deletion of Wexprolabs-managed beta data through the support
+and can request deletion of Wexprolabs-managed data through the support
 channel below.
 
 ## Security and access
@@ -94,10 +94,10 @@ obligations.
 
 ## Contact
 
-Wexprolabs customers should use their beta-agreement support contact. Product
+Wexprolabs customers should use their support contact. Product
 and privacy requests may also be opened at:
 
-https://github.com/saminkhan1/record-beta-releases/issues
+https://github.com/saminkhan1/record-releases/issues
 
 Do not include passwords, access tokens, or confidential recording contents in
 a public issue.

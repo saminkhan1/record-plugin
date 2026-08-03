@@ -260,8 +260,13 @@ def prepare_recording_build(
     workflow_path = recording_dir / "workflow.json"
     digest = workflow_digest(workflow)
     review = workflow.get("review") if isinstance(workflow.get("review"), dict) else {}
+    trigger = workflow.get("trigger")
+    webhook_requested = (
+        isinstance(trigger, dict) and trigger.get("requested") is True
+    )
     workflow["job_spec"] = modules["compiler"].validate_job_spec(
-        workflow.get("job_spec")
+        workflow.get("job_spec"),
+        require_schedule=not webhook_requested,
     )
     workflow_id = record_slug(str(workflow.get("id") or recording_dir.parent.name))
     build_digest = workflow_digest(workflow)
@@ -355,12 +360,12 @@ def load_recording_build(
             status_code=409,
             detail="The reviewed draft changed. Reload the workflow review.",
         )
-    job_spec = modules["compiler"].validate_job_spec(workflow.get("job_spec"))
-    expected_schedule = (
-        "triggered"
-        if str(run_mode or "").strip().lower() == "webhook"
-        else str(schedule or "").strip()
+    webhook_requested = str(run_mode or "").strip().lower() == "webhook"
+    job_spec = modules["compiler"].validate_job_spec(
+        workflow.get("job_spec"),
+        require_schedule=not webhook_requested,
     )
+    expected_schedule = "" if webhook_requested else str(schedule or "").strip()
     if expected_schedule != job_spec.get("schedule"):
         raise HTTPException(
             status_code=409,
@@ -618,7 +623,7 @@ def _publish_reviewed_record_build(
     ).hexdigest()
     promotion = modules["compiler"].promote_compiled_artifacts(build_dir, home)
     try:
-        install = modules["hermes"].install_cron_job(
+        install = modules["hermes"].install_workflow(
             payload,
             hermes_home=home,
             provenance=provenance,

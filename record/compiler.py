@@ -180,9 +180,15 @@ def validate_draft_plan(
 
     plan = contract.model_dump(mode="python")
     job_spec = dict(plan["job_spec"])
+    trigger = plan.get("trigger")
+    webhook_requested = (
+        isinstance(trigger, dict) and trigger.get("requested") is True
+    )
     for key, value in (job_defaults or {}).items():
         if key in {"name", "schedule", "deliver"}:
             job_spec[key] = str(value or "").strip()
+    if webhook_requested:
+        job_spec["schedule"] = ""
 
     script_source = _draft_script(plan.get("script_source"))
     if script_source is None:
@@ -195,7 +201,12 @@ def validate_draft_plan(
         )
         job_spec["script"] = (namespace / source_path).as_posix()
 
-    job_spec = validate_job_spec(job_spec)
+    job_spec = validate_job_spec(
+        job_spec,
+        require_schedule=not webhook_requested,
+    )
+    if webhook_requested:
+        _validate_webhook_execution_fields(job_spec)
     no_agent = job_spec["no_agent"]
     prompt = _optional_text(job_spec.get("prompt"), "job_spec.prompt")
     skills = _string_list(job_spec.get("skills"), "job_spec.skills")
@@ -205,6 +216,10 @@ def validate_draft_plan(
     )
 
     if no_agent:
+        if webhook_requested:
+            raise CompileError(
+                "Webhook workflows must use a Hermes agent run"
+            )
         if script_source is None:
             raise CompileError("No-agent jobs require script_source")
         if prompt or skills or toolsets:
@@ -480,8 +495,32 @@ def _optional_text(value: Any, field: str) -> str | None:
     return value.strip() or None
 
 
-def validate_job_spec(value: Any) -> dict[str, Any]:
-    """Validate the stored proposal with Hermes' maintained Cron request type."""
+def _validate_webhook_execution_fields(job_spec: dict[str, Any]) -> None:
+    unsupported = [
+        field
+        for field in (
+            "model",
+            "provider",
+            "base_url",
+            "context_from",
+            "enabled_toolsets",
+            "workdir",
+        )
+        if job_spec.get(field) not in (None, "", [])
+    ]
+    if unsupported:
+        raise CompileError(
+            "Webhook workflows use the active Hermes profile and cannot "
+            "override: " + ", ".join(unsupported)
+        )
+
+
+def validate_job_spec(
+    value: Any,
+    *,
+    require_schedule: bool = True,
+) -> dict[str, Any]:
+    """Validate the reviewed execution fields with Hermes' maintained type."""
 
     try:
         canonical = DraftJobSpec.model_validate(value).model_dump(
@@ -492,7 +531,7 @@ def validate_job_spec(value: Any) -> dict[str, Any]:
         raise _contract_error("Job specification", exc) from exc
     if not str(canonical.get("name") or "").strip():
         raise CompileError("job_spec.name is required")
-    if not str(canonical.get("schedule") or "").strip():
+    if require_schedule and not str(canonical.get("schedule") or "").strip():
         raise CompileError("job_spec.schedule is required")
     if canonical.get("enabled_toolsets") == []:
         canonical.pop("enabled_toolsets")
@@ -536,7 +575,16 @@ def compile_workflow(
     *,
     provenance: dict[str, Any] | None = None,
 ) -> CompileResult:
-    job_spec = validate_job_spec(workflow.get("job_spec"))
+    trigger = workflow.get("trigger")
+    webhook_requested = (
+        isinstance(trigger, dict) and trigger.get("requested") is True
+    )
+    job_spec = validate_job_spec(
+        workflow.get("job_spec"),
+        require_schedule=not webhook_requested,
+    )
+    if webhook_requested:
+        _validate_webhook_execution_fields(job_spec)
     no_agent = job_spec["no_agent"]
     script_source = _draft_script(workflow.get("script_source"))
     script_name = job_spec.get("script")
@@ -551,6 +599,10 @@ def compile_workflow(
         "job_spec.enabled_toolsets",
     )
     if no_agent:
+        if webhook_requested:
+            raise CompileError(
+                "Webhook workflows must use a Hermes agent run"
+            )
         if not script_source or prompt or skills or toolsets:
             raise CompileError(
                 "No-agent jobs require only script_source and cannot include prompt, skills, or enabled_toolsets"

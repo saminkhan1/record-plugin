@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import importlib
 import importlib.util
 import json
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +40,7 @@ def _plan(trigger):
         "trigger": trigger,
         "job_spec": {
             "name": "Handle paid invoice",
-            "schedule": "triggered",
+            "schedule": "",
             "deliver": "local",
             "no_agent": False,
             "prompt": "Use the current signed event payload and verify the result.",
@@ -73,10 +79,10 @@ def test_supported_webhook_trigger_normalizes_reviewed_filter():
     "run_mode,schedule,expected",
     [
         ("schedule", "weekdays at 9am", ("schedule", "weekdays at 9am")),
-        ("webhook", "", ("webhook", "triggered")),
+        ("webhook", "", ("webhook", "")),
     ],
 )
-def test_desktop_start_mode_maps_webhooks_to_triggered_cron(
+def test_desktop_start_mode_keeps_webhooks_out_of_cron(
     run_mode, schedule, expected
 ):
     plugin_api = _load_plugin_module("dashboard.plugin_api")
@@ -88,7 +94,7 @@ def test_desktop_webhook_status_reports_host_capability_gap(tmp_path, monkeypatc
     plugin_api = _load_plugin_module("dashboard.plugin_api")
     unavailable = types.SimpleNamespace(
         webhook_runtime_status=lambda **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("Cron webhook triggers are unavailable")
+            RuntimeError("Webhook subscriptions are unavailable")
         )
     )
     monkeypatch.setattr(
@@ -106,54 +112,27 @@ def test_desktop_webhook_status_reports_host_capability_gap(tmp_path, monkeypatc
 
     assert status["ready"] is False
     assert status["configured"] is False
-    assert status["reason"] == "Cron webhook triggers are unavailable"
+    assert status["reason"] == "Webhook subscriptions are unavailable"
 
 
-def test_install_creates_triggered_job_then_route_then_nonsecret_receipt(
-    tmp_path, monkeypatch
-):
+def test_install_creates_native_subscription_without_cron(tmp_path, monkeypatch):
     hermes = _load_plugin_module("record.hermes")
-    calls = []
-    job = {
-        "id": "job-123",
-        "name": "Paid invoice workflow",
-        "schedule": "triggered",
-        "schedule_display": "triggered",
-    }
-
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(hermes, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         hermes,
         "_dispatch_cron_tool",
-        lambda arguments: calls.append(("cron", arguments))
-        or {"success": True, "job_id": "job-123", "job": job},
-    )
-    monkeypatch.setattr(
-        hermes,
-        "install_webhook_trigger",
-        lambda **kwargs: calls.append(("webhook", kwargs))
-        or {
-            "name": "record-paid-invoice-job-123",
-            "url": "https://hooks.example.test/webhooks/record-paid-invoice-job-123",
-            "secret": "one-time-secret",
-            "events": ["invoice.paid"],
-            "job_id": "job-123",
-        },
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "cron",
-        types.SimpleNamespace(
-            list_jobs=lambda include_disabled=True: [],
-            get_job=lambda job_id: job if job_id == "job-123" else None,
-        ),
+        lambda _arguments: pytest.fail("webhook install must not call Cron"),
     )
 
-    result = hermes.install_cron_job(
+    result = hermes.install_workflow(
         {
-            "name": job["name"],
+            "name": "Paid invoice workflow",
             "prompt": "Handle the paid invoice.",
-            "schedule": "triggered",
+            "schedule": "",
+            "deliver": "local",
+            "no_agent": False,
+            "skills": [],
         },
         hermes_home=tmp_path,
         provenance={
@@ -163,59 +142,46 @@ def test_install_creates_triggered_job_then_route_then_nonsecret_receipt(
         webhook_trigger=_supported_trigger(),
     )
 
-    assert calls[0][0] == "cron"
-    assert calls[0][1]["action"] == "create"
-    assert calls[0][1]["schedule"] == "triggered"
-    assert calls[1][0] == "webhook"
-    assert result["webhook"]["secret"] == "one-time-secret"
+    assert result["job_id"] is None
+    assert result["webhook"]["secret"]
+    subscriptions = json.loads(
+        (tmp_path / "webhook_subscriptions.json").read_text(encoding="utf-8")
+    )
+    route = subscriptions[result["webhook"]["name"]]
+    assert route["events"] == ["invoice.paid"]
+    assert route["filters"] == [
+        {"field": "customer.tier", "equals": "managed"}
+    ]
+    assert route["deliver"] == "log"
+    assert "{__raw__}" in route["prompt"]
+    assert route["record"]["workflow_id"] == "paid-invoice"
     receipt = json.loads(
         (tmp_path / "record" / "install-receipts" / f"{'a' * 64}.json").read_text(
             encoding="utf-8"
         )
     )
-    assert receipt["webhook"]["url"].startswith("https://hooks.example.test/")
+    assert receipt["kind"] == "webhook"
+    assert receipt["webhook"]["url"].endswith(result["webhook"]["name"])
     assert "secret" not in receipt["webhook"]
 
 
-def test_route_failure_rolls_back_new_cron_job(tmp_path, monkeypatch):
+def test_receipt_failure_rolls_back_native_subscription(tmp_path, monkeypatch):
     hermes = _load_plugin_module("record.hermes")
-    calls = []
-    job = {
-        "id": "job-rollback",
-        "name": "Rollback workflow",
-        "schedule": "triggered",
-        "schedule_display": "triggered",
-    }
-
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(hermes, "get_hermes_home", lambda: tmp_path)
-
-    def dispatch(arguments):
-        calls.append(arguments)
-        if arguments["action"] == "create":
-            return {"success": True, "job_id": job["id"], "job": job}
-        return {"success": True}
-
-    monkeypatch.setattr(hermes, "_dispatch_cron_tool", dispatch)
     monkeypatch.setattr(
         hermes,
-        "install_webhook_trigger",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("route failed")),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "cron",
-        types.SimpleNamespace(
-            list_jobs=lambda include_disabled=True: [],
-            get_job=lambda job_id: job if job_id == job["id"] else None,
-        ),
+        "_write_install_receipt",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("receipt failed")),
     )
 
-    with pytest.raises(RuntimeError, match="route failed"):
-        hermes.install_cron_job(
+    with pytest.raises(RuntimeError, match="receipt failed"):
+        hermes.install_workflow(
             {
-                "name": job["name"],
+                "name": "Rollback workflow",
                 "prompt": "Handle the event.",
-                "schedule": "triggered",
+                "schedule": "",
+                "no_agent": False,
             },
             hermes_home=tmp_path,
             provenance={
@@ -225,7 +191,81 @@ def test_route_failure_rolls_back_new_cron_job(tmp_path, monkeypatch):
             webhook_trigger=_supported_trigger(),
         )
 
-    assert [call["action"] for call in calls] == ["create", "remove"]
+    subscriptions_path = tmp_path / "webhook_subscriptions.json"
+    assert json.loads(subscriptions_path.read_text(encoding="utf-8")) == {}
     assert not (
         tmp_path / "record" / "install-receipts" / f"{'b' * 64}.json"
     ).exists()
+
+
+def test_installed_route_is_loaded_and_accepts_signed_event(tmp_path, monkeypatch):
+    hermes = _load_plugin_module("record.hermes")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes, "get_hermes_home", lambda: tmp_path)
+    result = hermes.install_workflow(
+        {
+            "name": "Paid invoice workflow",
+            "prompt": "Handle the paid invoice.",
+            "schedule": "",
+            "deliver": "local",
+            "no_agent": False,
+            "skills": [],
+        },
+        hermes_home=tmp_path,
+        provenance={
+            "workflow_id": "paid-invoice",
+            "install_idempotency_key": "c" * 64,
+        },
+        webhook_trigger=_supported_trigger(),
+    )
+
+    from gateway.config import PlatformConfig
+    from gateway.platforms.webhook import WebhookAdapter
+
+    async def exercise_route():
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"host": "127.0.0.1", "port": 0, "routes": {}},
+            )
+        )
+        adapter._reload_dynamic_routes()
+        adapter.handle_message = AsyncMock()
+        app = web.Application(client_max_size=adapter._max_body_bytes)
+        app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            body = json.dumps(
+                {
+                    "event_type": "invoice.paid",
+                    "customer": {"tier": "managed"},
+                    "invoice_id": "inv-123",
+                }
+            ).encode()
+            secret = result["webhook"]["secret"].encode()
+            signature = "sha256=" + hmac.new(
+                secret,
+                body,
+                hashlib.sha256,
+            ).hexdigest()
+            response = await client.post(
+                f"/webhooks/{result['webhook']['name']}",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": signature,
+                    "X-GitHub-Event": "invoice.paid",
+                    "X-GitHub-Delivery": "delivery-123",
+                },
+            )
+            assert response.status == 202
+            assert (await response.json())["status"] == "accepted"
+            await asyncio.sleep(0)
+            event = adapter.handle_message.await_args.args[0]
+            assert "Handle the paid invoice." in event.text
+            assert '"invoice_id": "inv-123"' in event.text
+        finally:
+            await client.close()
+
+    asyncio.run(exercise_route())

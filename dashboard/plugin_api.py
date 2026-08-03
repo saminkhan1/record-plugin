@@ -777,7 +777,7 @@ def _start_mode(run_mode: str, schedule: str) -> tuple[str, str]:
             status_code=400,
             detail="Choose a schedule or an event trigger before recording.",
         )
-    return mode, "triggered" if mode == "webhook" else normalized_schedule
+    return mode, "" if mode == "webhook" else normalized_schedule
 
 
 def _desktop_capture_authorization_claim(

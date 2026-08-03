@@ -1,4 +1,4 @@
-# Hermes Chrome Provider beta submission
+# Record Chrome Provider submission
 
 This is the reviewed submission inventory for extension version `0.2.1`. It is
 an operator checklist, not authorization to create or publish a Chrome Web Store
@@ -23,9 +23,9 @@ either identity, and never publish from this checklist.
 
 ## Store listing template
 
-Name: `Hermes Chrome Provider BETA`
+Name: `Record Chrome Provider`
 
-Description opening: `THIS EXTENSION IS FOR BETA TESTING.`
+Description opening: `Record Chrome Provider works with the Hermes Mac application.`
 
 Category: `Workflow & Planning`
 
@@ -33,9 +33,7 @@ Language: `English (United States)`
 
 Detailed description:
 
-> THIS EXTENSION IS FOR BETA TESTING.
->
-> Hermes Chrome Provider works with the Hermes Mac application. Its single
+> Record Chrome Provider works with the Hermes Mac application. Its single
 > purpose is to capture a user's Chrome actions and visual evidence only while a
 > local Record recording is active, so Hermes can create a workflow draft
 > for the user to review.
@@ -117,7 +115,7 @@ before saving the Privacy page rather than supplying a remote-code justification
 ## Privacy practices
 
 - [x] Conservatively select **all nine** Chrome Web Store user-data categories
-      for this beta capture surface:
+      for this capture surface:
   - `Personally identifiable information`
   - `Health information`
   - `Financial and payment information`
@@ -136,10 +134,10 @@ before saving the Privacy page rather than supplying a remote-code justification
 - [x] Paste each permission justification without weakening its scope.
 - [ ] Certify Limited Use only after product/legal verifies that actual Hermes
       handling complies with every certification shown in the dashboard.
-- [x] Provide the Wexprolabs Record beta privacy-policy URL describing
+- [x] Provide the Wexprolabs Record privacy-policy URL describing
       collection, use, transfer to the local native application, configured-model
       and configured-Langfuse processing, retention, deletion, and support access:
-      `https://github.com/saminkhan1/record-beta-releases/blob/main/PRIVACY.md`.
+      `https://github.com/saminkhan1/record-releases/blob/main/PRIVACY.md`.
       The source policy is retained in
       `release/chrome/WEXPROLABS_RECORD_PRIVACY.md`.
 - [x] Ensure the listing and privacy policy accurately disclose collection and
@@ -157,7 +155,7 @@ before saving the Privacy page rather than supplying a remote-code justification
 - [x] Package icon: `icons/icon128.png`, deterministic 128x128 PNG derived from
       the desktop app icon.
 - [ ] At least one real 1280x800 workflow-recording screenshot with no customer
-      data. **External blocker: capture and approve the final signed beta UI.**
+      data. **External blocker: capture and approve the final signed UI.**
 - [x] Optional small promotional tile prepared at
       `release/chrome/cws-assets/small-promo-tile.png`. It is a 440x280,
       8-bit-per-channel RGB PNG without alpha. Product approval is still required
@@ -165,28 +163,28 @@ before saving the Privacy page rather than supplying a remote-code justification
       submission requirement.
 
 Do not synthesize a workflow screenshot or privacy URL. The required screenshot
-must show the real final signed beta UI; the optional promotional tile must not
+must show the real final signed UI; the optional promotional tile must not
 substitute for runtime evidence.
 
 ## Distribution and signed-in acceptance
 
 - [ ] Add the intended tester Google accounts in Publisher settings.
 - [ ] Select `Private` and `Only trusted testers from the current publisher`.
-- [ ] Confirm the name ends in `BETA` and the description opens with
-      `THIS EXTENSION IS FOR BETA TESTING`.
+- [ ] Confirm the name is `Record Chrome Provider` and the description opens
+      with `Record Chrome Provider works with the Hermes Mac application`.
 - [ ] Provide reviewer instructions for starting/stopping a local Hermes
       recording and exercising the extension. Supply test credentials only through
       the dashboard's protected field when they are actually needed.
 
   Paste-ready instructions (replace the final placeholder with the public,
-  signed/notarized beta download):
+  signed/notarized download):
 
-  > Requires the signed/notarized Record macOS beta. Install and launch
+  > Requires the signed/notarized Record macOS application. Install and launch
   > Hermes once, then open Workflows in Hermes Desktop. Start a recording, visit
   > a public HTTPS page, click or type non-sensitive test text, stop the
   > recording, and verify that a workflow draft appears. The extension popup
   > should show its local native-host connection. No Web Store login is required.
-  > Beta download: `SIGNED_NOTARIZED_BETA_DOWNLOAD_URL`
+  > Download: `SIGNED_NOTARIZED_DOWNLOAD_URL`
 
 - [ ] Complete Store listing and Privacy practices, then submit for review.
       Private items have the same policy review requirements as public items.
@@ -195,7 +193,7 @@ substitute for runtime evidence.
       launch the signed/notarized Hermes app once, install/enable the store
       extension, and confirm `chrome://extensions` shows the exact assigned ID in
       `store-identity.json` and version `0.2.1`.
-- [ ] If local-file workflows are part of the beta, enable **Allow access to
+- [ ] If local-file workflows are part of the release, enable **Allow access to
       file URLs** in the extension details and verify one non-sensitive
       `file://` recording. Do not claim local-file capture without that setting.
 - [ ] Record a Chrome-to-Mac workflow, stop it, generate a draft, review and
@@ -209,7 +207,7 @@ Official references:
 - [Manifest key and dashboard-assigned identity](https://developer.chrome.com/docs/extensions/reference/manifest/key)
 - [Store listing and required assets](https://developer.chrome.com/docs/webstore/cws-dashboard-listing)
 - [Privacy fields and permission justifications](https://developer.chrome.com/docs/webstore/cws-dashboard-privacy)
-- [Private trusted testers and beta labeling](https://developer.chrome.com/docs/webstore/cws-dashboard-distribution)
+- [Private trusted testers and distribution](https://developer.chrome.com/docs/webstore/cws-dashboard-distribution)
 - [Chrome Web Store Limited Use](https://developer.chrome.com/docs/webstore/program-policies/limited-use)
 - [Chrome Web Store policy updates effective 2026-08-01](https://developer.chrome.com/blog/cws-policy-updates-2026)
 - [Chrome Web Store Program Policies](https://developer.chrome.com/docs/webstore/program-policies/policies)

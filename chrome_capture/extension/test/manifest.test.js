@@ -18,8 +18,11 @@ test('Web Store manifest uses the reviewed 128px app icon', () => {
     .map(character => String.fromCharCode('a'.charCodeAt(0) + Number.parseInt(character, 16)))
     .join('')
 
-  assert.equal(manifest.name, 'Record Chrome Provider BETA')
-  assert.match(manifest.description, /^THIS EXTENSION IS FOR BETA TESTING\./)
+  assert.equal(manifest.name, 'Record Chrome Provider')
+  assert.equal(
+    manifest.description,
+    'Capture active Chrome workflow actions into a local Record workflow for review.'
+  )
   assert.ok(['bootstrap-required', 'assigned'].includes(identity.status))
   if (identity.status === 'bootstrap-required') {
     assert.equal(identity.extensionId, '')
@@ -33,6 +36,6 @@ test('Web Store manifest uses the reviewed 128px app icon', () => {
   assert.equal(icon.readUInt32BE(20), 128)
   assert.equal(
     crypto.createHash('sha256').update(icon).digest('hex'),
-    'd9a0e51189953769dab6add58c8f55dcb0231e8430affafdd9045b7848631fec'
+    'c82640fef1fc216379ee83cba97112ba667c0c334596b87dfa246c4bab7c19fb'
   )
 })

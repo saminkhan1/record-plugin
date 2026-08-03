@@ -286,7 +286,7 @@ def author_workflow(
             workflow_id = str(evidence.get("workflow_id") or trace_scope)
             schedule = str(evidence.get("requested_schedule") or "").strip()
             if evidence.get("trigger_requested") is True:
-                schedule = "triggered"
+                schedule = ""
             job_defaults = {
                 "name": str(evidence.get("name") or instructions).strip(),
                 "schedule": schedule,
@@ -414,7 +414,9 @@ The proposal contains:
   provide a complete fresh-session prompt, exact installed skill names, and
   no_agent=false. For a no-agent job, use an empty prompt, no skills, and
   no_agent=true. Leave context_from, enabled_toolsets, and workdir unset so the
-  selected Hermes profile keeps its normal Cron configuration.
+  selected Hermes profile keeps its normal runtime configuration. For webhook
+  workflows also leave model, provider, and base_url unset because Hermes'
+  native webhook agent uses the active profile's configured model.
 - script_source only when the job uses a deterministic script: a safe relative
   .py, .sh, or .bash path plus the complete source. Record validates, stages,
   hashes, and places it at the exact path stored in job_spec.
