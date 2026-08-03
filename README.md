@@ -49,12 +49,8 @@ ongoing workflow management.
 The port preserves the recorder's current capture and secure-input behavior.
 The packaging and Desktop layers add no new filtering or redaction feature.
 
-This boundary follows the official
-[Hermes plugin system](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins),
-[Desktop app](https://hermes-agent.nousresearch.com/docs/user-guide/desktop),
-[Desktop Plugin SDK](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk),
-and [Cron](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
-contracts.
+This boundary follows the host application's documented plugin system, Desktop
+app, Desktop Plugin SDK, and Cron contracts.
 
 ## Installed layout
 
@@ -352,12 +348,10 @@ the bundled Langfuse plugin remains the sole trace client and store.
 
 Desktop supports both time-backed and event-backed jobs. Record does not add a
 second receiver: it installs a reviewed dynamic subscription into Hermes'
-profile-scoped, HMAC-authenticated
-[webhook surface](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks).
+profile-scoped, HMAC-authenticated webhook surface.
 Matching deliveries use Hermes' native event filtering, replay protection,
 payload templating, skill loading, agent sessions, and delivery behavior.
-[Cron](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
-continues to own only time-backed workflows. Desktop reports the selected
+Cron continues to own only time-backed workflows. Desktop reports the selected
 profile's receiver readiness and refuses activation until the gateway's
 webhook receiver is live.
 
