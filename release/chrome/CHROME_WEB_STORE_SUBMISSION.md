@@ -164,9 +164,9 @@ before saving the Privacy page rather than supplying a remote-code justification
       before upload, but the live dashboard does not mark this tile as a
       submission requirement.
 
-Do not synthesize a workflow screenshot or privacy URL. The required screenshot
-must show the real final signed UI; the optional promotional tile must not
-substitute for runtime evidence.
+Use only the approved no-customer-data workflow-review screenshot and the
+verified public privacy URL. The optional promotional tile must not substitute
+for the required screenshot.
 
 ## Distribution and signed-in acceptance
 
