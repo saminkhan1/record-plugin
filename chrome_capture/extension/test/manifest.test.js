@@ -23,7 +23,7 @@ test('Web Store manifest uses the reviewed 128px app icon', () => {
     manifest.description,
     'Capture active Chrome workflow actions into a local Record workflow for review.'
   )
-  assert.ok(['bootstrap-required', 'assigned'].includes(identity.status))
+  assert.ok(['bootstrap-required', 'assigned', 'published'].includes(identity.status))
   if (identity.status === 'bootstrap-required') {
     assert.equal(identity.extensionId, '')
     assert.equal(developmentExtensionId, identity.provisionalDevelopmentExtensionId)

@@ -1,8 +1,7 @@
 # Record Chrome Provider submission
 
-This is the reviewed submission inventory for extension version `0.2.2`. It is
-an operator checklist, not authorization to create or publish a Chrome Web Store
-item.
+This is the reviewed release inventory for published extension version `0.2.2`.
+It preserves the Store identity and customer-install validation steps.
 
 ## Account and identity gate
 
@@ -16,7 +15,7 @@ item.
 - [x] Compare `dist/chrome/package-receipt.json` with the reviewed source and
       commit before building the signed Mac release.
 
-The assigned Chrome Web Store Item ID is
+The published Chrome Web Store Item ID is
 `anaccpcogeinfllkciaheolngknaabbb`. The retained bootstrap audit identity is
 `pjgpgncokdchfamgpaniekieplapoacg`. Never create a replacement item to change
 either identity, and never publish from this checklist.
@@ -170,27 +169,21 @@ for the required screenshot.
 
 ## Distribution and signed-in acceptance
 
-- [ ] Add the intended tester Google accounts in Publisher settings.
-- [ ] Select `Private` and `Only trusted testers from the current publisher`.
 - [x] Confirm the name is `Record Chrome Provider` and the description opens
       with `Record Chrome Provider works with the Record Mac application`.
-- [ ] Provide reviewer instructions for starting/stopping a local Record
-      recording and exercising the extension. Supply test credentials only through
-      the dashboard's protected field when they are actually needed.
+- [x] Google approved the current `0.2.2` Store package. Keep
+      `store-identity.json` at `published`; do not create a replacement item.
 
-  Paste-ready instructions (replace the final placeholder with the public,
-  signed/notarized download):
+  Customer verification instructions:
 
   > Requires the signed/notarized Record macOS application. Install and launch
   > Record once, then open Workflows in Record Desktop. Start a recording, visit
   > a public HTTPS page, click or type non-sensitive test text, stop the
   > recording, and verify that a workflow draft appears. The extension popup
   > should show its local native-host connection. No Web Store login is required.
-  > Download: `SIGNED_NOTARIZED_DOWNLOAD_URL`
+  > Download the signed/notarized Record release from the corresponding GitHub
+  > release assets.
 
-- [ ] Complete Store listing and Privacy practices, then submit for review.
-      Private items have the same policy review requirements as public items.
-- [ ] After approval, publish to trusted testers from the dashboard.
 - [ ] On a clean physical Mac, sign Chrome into an allowlisted tester account,
       launch the signed/notarized Record app once, install/enable the store
       extension, and confirm `chrome://extensions` shows the exact assigned ID in
