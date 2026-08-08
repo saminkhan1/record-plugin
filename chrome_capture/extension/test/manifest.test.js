@@ -59,17 +59,21 @@ test('Web Store manifest uses the reviewed 128px app icon', () => {
   )
 })
 
-test('Store identity distinguishes the published item from the unpublished candidate bytes', () => {
+test('Store identity binds the published version to its approved source and archive', () => {
   const repositoryRoot = path.resolve(extensionRoot, '..', '..')
   const chrome = validateChromeExtensionIdentity(repositoryRoot)
 
   assert.equal(chrome.status, 'published')
   assert.equal(chrome.version, '0.2.3')
-  assert.equal(chrome.publishedVersion, '0.2.2')
-  assert.equal(chrome.currentVersionPublished, false)
-  assert.throws(
-    () => validateChromeExtensionIdentity(repositoryRoot, { requirePublishedVersion: true }),
-    /Chrome extension 0\.2\.3 is not published/u
+  assert.equal(chrome.publishedVersion, '0.2.3')
+  assert.equal(chrome.currentVersionPublished, true)
+  assert.equal(chrome.publishedSourceCommit, '4981ff96732c70efbf9c709bd7c327fe7ec015e9')
+  assert.equal(
+    chrome.publishedArchiveSha256,
+    'be36707347d9e978854ad571d0bf48000d8aa86daad5e626417de581082d7bdc'
+  )
+  assert.doesNotThrow(() =>
+    validateChromeExtensionIdentity(repositoryRoot, { requirePublishedVersion: true })
   )
 })
 

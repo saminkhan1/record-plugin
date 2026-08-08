@@ -298,15 +298,13 @@ installed profile uses them. Whole-product cleanup may remove shared components
 only after no Record-enabled profile, active recording, or recorder service
 remains.
 
-The Web Store item is published at extension version `0.2.2`, while this source
-contains the `0.2.3` update candidate. `npm run package:chrome:release` requires
-a clean Git HEAD and binds that commit to the deterministic ZIP receipt. The Mac
-packager and customer installer reject `--chrome store` until
-`store-identity.json` records the exact approved `0.2.3` version, release ZIP
-SHA-256, and source commit. Do not update those approval fields before the Web
-Store reports the candidate published. Use `--chrome none` only for local
-lifecycle validation on a machine whose reviewed native-host registration is
-already present; it is not customer-distribution proof.
+The Web Store item is published at extension version `0.2.3`. Its reviewed
+release ZIP and clean source commit are bound in `store-identity.json`; the Mac
+packager reproduces those exact extension bytes before allowing `--chrome
+store`. `npm run package:chrome:release` requires a clean Git HEAD and binds
+that commit to the deterministic ZIP receipt. Use `--chrome none` only for
+local lifecycle validation on a machine whose reviewed native-host
+registration is already present; it is not customer-distribution proof.
 
 Restart the backend for the work profile just installed so its Python plugin
 routes reload. Hermes Desktop watches its primary profile's

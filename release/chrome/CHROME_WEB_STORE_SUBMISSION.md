@@ -1,8 +1,7 @@
 # Record Chrome Provider submission
 
-This is the submission inventory for extension update candidate `0.2.3`.
-Version `0.2.2` remains the currently published Store package. This checklist
-does not mark the new candidate approved or published.
+This is the submission inventory for published extension version `0.2.3`.
+Google's public update service began serving that version on 2026-08-08.
 
 ## Account and identity gate
 
@@ -10,13 +9,15 @@ does not mark the new candidate approved or published.
       `saminbbkhan` accepted the first draft item.
 - [x] The assigned Item ID and dashboard public key are bound in the manifest and
       `store-identity.json`; the packaging gate derives and verifies the same ID.
-- [ ] From a clean reviewed commit, run `npm test` and
+- [x] From clean reviewed commit
+      `4981ff96732c70efbf9c709bd7c327fe7ec015e9`, run `npm test` and
       `npm run package:chrome:release`, then upload
       `dist/chrome/hermes-chrome-provider-0.2.3.zip` to the existing item.
       Do not create a replacement item.
-- [ ] Verify `dist/chrome/package-receipt.json` says `release: true`, records the
-      exact clean source commit, and matches the uploaded ZIP SHA-256 before
-      submitting for review.
+- [x] Verify `dist/chrome/package-receipt.json` says `release: true`, records the
+      exact clean source commit, and matches uploaded ZIP SHA-256
+      `be36707347d9e978854ad571d0bf48000d8aa86daad5e626417de581082d7bdc`
+      before submitting for review.
 
 The published Chrome Web Store Item ID is
 `anaccpcogeinfllkciaheolngknaabbb`. The retained bootstrap audit identity is
@@ -174,13 +175,12 @@ for the required screenshot.
 
 - [x] Confirm the name is `Record Chrome Provider` and the description opens
       with `Record Chrome Provider works with the Record Mac application`.
-- [x] Google approved the existing `0.2.2` Store package. Keep the same item and
-      public key; do not create a replacement item.
-- [ ] Google approves and publishes `0.2.3` to the intended distribution. Only
-      then copy the exact release receipt's version, archive SHA-256, and source
+- [x] Google approved and published `0.2.3` to the intended distribution on
+      2026-08-08. The public update service serves item
+      `anaccpcogeinfllkciaheolngknaabbb` at version `0.2.3`.
+- [x] Copy the exact release receipt's version, archive SHA-256, and source
       commit into `store-identity.json` as `publishedVersion`,
-      `publishedArchiveSha256`, and `publishedSourceCommit`. Until that commit,
-      Mac release packaging and customer Store installation must remain blocked.
+      `publishedArchiveSha256`, and `publishedSourceCommit`.
 
   Customer verification instructions:
 

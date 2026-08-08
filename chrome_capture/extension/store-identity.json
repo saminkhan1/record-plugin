@@ -2,8 +2,8 @@
   "schemaVersion": 2,
   "status": "published",
   "extensionId": "anaccpcogeinfllkciaheolngknaabbb",
-  "publishedVersion": "0.2.2",
-  "publishedArchiveSha256": "4c2075d3d4879098ef60097ecf587b3785a8e8fe94b3bb70eda32ba666d03fc3",
-  "publishedSourceCommit": "560e2e0cb17f5e416c91b348cbdabe7271e89f3a",
+  "publishedVersion": "0.2.3",
+  "publishedArchiveSha256": "be36707347d9e978854ad571d0bf48000d8aa86daad5e626417de581082d7bdc",
+  "publishedSourceCommit": "4981ff96732c70efbf9c709bd7c327fe7ec015e9",
   "provisionalDevelopmentExtensionId": "pjgpgncokdchfamgpaniekieplapoacg"
 }
