@@ -199,7 +199,12 @@ def validate_draft_plan(
             script_source["path"],
             "script_source.path",
         )
-        job_spec["script"] = (namespace / source_path).as_posix()
+        script_digest = hashlib.sha256(
+            _ensure_trailing_newline(script_source["body"]).encode("utf-8")
+        ).hexdigest()
+        job_spec["script"] = (
+            namespace / script_digest / source_path
+        ).as_posix()
 
     job_spec = validate_job_spec(
         job_spec,
@@ -551,11 +556,16 @@ class PromotedArtifacts:
                 os.replace(backup, destination)
         self.records.clear()
 
-    def commit(self) -> None:
+    def commit(self) -> list[str]:
+        failures: list[str] = []
         for _destination, backup in self.records:
             if backup:
-                _remove_path(backup)
+                try:
+                    _remove_path(backup)
+                except OSError as exc:
+                    failures.append(f"{backup}: {exc}")
         self.records.clear()
+        return failures
 
 
 def load_workflow(path: Path) -> dict[str, Any]:
@@ -749,6 +759,21 @@ def promote_compiled_artifacts(build_dir: Path, hermes_home: Path) -> PromotedAr
             source = (build_dir / artifact["source"]).resolve()
             destination = _promotion_destination(home, artifact["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)
+            destination_parts = Path(artifact["destination"]).parts
+            is_record_script = destination_parts[:2] == ("scripts", "record")
+            if is_record_script and (
+                destination.exists() or destination.is_symlink()
+            ):
+                if (
+                    artifact["kind"] == "file"
+                    and destination.is_file()
+                    and not destination.is_symlink()
+                    and source.read_bytes() == destination.read_bytes()
+                ):
+                    continue
+                raise CompileError(
+                    "Existing Record script path does not match the reviewed content"
+                )
             token = uuid.uuid4().hex
             temporary = destination.with_name(f".{destination.name}.record-{token}.tmp")
             backup = destination.with_name(f".{destination.name}.record-{token}.backup")

@@ -1,13 +1,18 @@
-# Record
+# Record for Wexpro Agent
 
-Record is a standalone extension for stock Hermes Agent. On Apple-
-silicon macOS it records one demonstrated Mac + Chrome workflow, drafts it
-with the Hermes profile currently selected in Desktop, keeps the result
-reviewable, and installs the reviewed result as a standard Hermes Cron job.
+Record is Wexpro's record-review-run workflow extension for Apple-silicon
+macOS. Wexpro Agent is based on the open-source
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), and intentionally
+keeps Hermes' profiles, tools, skills, MCP integrations, scheduler, sessions,
+and plugin contracts. Record captures one demonstrated Mac + Chrome workflow,
+drafts it with the selected profile's model through a host-enforced read-only
+discovery and typed-submit tool boundary, keeps the executable proposal
+reviewable, and installs the approved result as a native Hermes Cron job or
+signed webhook subscription.
 
-Record never creates, names, or owns Hermes profiles. A normal installation
-uses Hermes' existing default home. If the user has already selected a named
-profile in stock Hermes, Record can follow that existing selection, but it
+Record never creates, names, or owns agent profiles. A normal installation
+uses the existing default Hermes-compatible home. If the user has already
+selected a named profile in Wexpro Agent, Record can follow that selection, but it
 will fail rather than create a missing profile.
 
 Desktop is the only Workflows launch surface. The dashboard directory exists
@@ -24,17 +29,21 @@ demonstrated workflow:
 - recording evidence, drafting prompts, compilation, and review receipts;
 - the Desktop page, sidebar item, status item, and command-palette actions.
 
-Stock Hermes owns profiles, model/provider credentials, `ctx.llm`, skills,
-tools, sessions, approvals, Cron persistence and execution, webhook ingress,
-and its bundled Langfuse integration. Record does not ship a Hermes runtime,
-fork the agent loop, maintain a second scheduler, add an execution ledger, or
-create a second observability client.
+The Wexpro host owns profiles, model/provider credentials, the full agent loop,
+skills, tools, MCP servers, sessions, approvals, Cron persistence and
+execution, webhook ingress, and the bundled Langfuse integration. Wexpro adds
+two narrow host contracts required by Record: a plugin-facing full-agent run
+facade and an atomic webhook-subscription mutation API. Record reuses those
+contracts; it does not ship another runtime, agent loop, scheduler, execution
+ledger, or observability client. Short clarification turns may use the host's
+`ctx.llm`, but executable workflow drafting does not.
 
 The launch flow is:
 
 1. record Mac + Chrome activity;
 2. stop and seal the recording;
-3. draft through the selected profile's `ctx.llm`;
+3. draft through the selected profile's host agent, limited to skill/tool
+   discovery, description, and the typed draft submission tool;
 4. review or redraft the exact workflow;
 5. set it as a standard Hermes Cron job that runs on a schedule or waits for a
    signed webhook event;
@@ -46,11 +55,14 @@ recording is still actively capturing on the Mac. Stopped recordings and draft
 artifacts never replace the new-workflow form; after installation, Cron owns
 ongoing workflow management.
 
-The port preserves the recorder's current capture and secure-input behavior.
-The packaging and Desktop layers add no new filtering or redaction feature.
+The port preserves the recorder's capture and secure-input behavior. Recorded
+URLs retain ordinary query and fragment data needed for replay while values of
+credential-like query parameters are redacted.
 
-This boundary follows the host application's documented plugin system, Desktop
-app, Desktop Plugin SDK, and Cron contracts.
+The final draft crosses one typed boundary, `record_submit_draft`, and is then
+validated and sealed before publication. This boundary follows upstream
+Hermes' plugin, Desktop, Cron, session, and tool contracts plus the two narrow
+Wexpro host extensions above.
 
 ## Installed layout
 
@@ -74,7 +86,7 @@ $HERMES_ROOT/
     └── chrome_capture/
 ```
 
-Existing named profiles remain entirely owned by stock Hermes. If Hermes
+Existing named profiles remain entirely owned by the Wexpro/Hermes host. If Hermes
 Desktop already has one selected, the installer may follow Hermes' resolver,
 but it verifies that profile already exists and never creates or renames it.
 
@@ -110,9 +122,8 @@ backend and does not copy or bundle Hermes.
 ## Requirements
 
 - Apple-silicon Mac (`arm64`) running macOS 13 or newer;
-- a stock Hermes Agent/Desktop release with the Desktop Plugin SDK,
-  plugin-owned `ctx.llm`, standard lifecycle hooks, and public plugin tool
-  dispatch;
+- a compatible Wexpro Agent/Desktop build with the upstream plugin APIs plus
+  `PluginContext.agent.run` and atomic `mutate_subscriptions` support;
 - Node.js 20 or newer and Apple's Swift toolchain to build locally;
 - one stable macOS code-signing identity;
 - Google Chrome and the published Record Chrome Provider Web Store extension
@@ -127,9 +138,10 @@ TCC. The user grants Accessibility, Screen Recording, and Input Monitoring to
 that stable Developer ID app; a row for an older ad-hoc or profile-local build
 is not release evidence.
 
-These Hermes requirements are capability-gated rather than inferred from a
-version number. The installer probes them and fails closed. Record never
-vendors or patches a Hermes runtime during installation.
+These host requirements are checked as concrete features rather than an exact
+fork version number. Both plugin registration and the installer fail closed
+when the required callables are absent. Record never vendors or patches the
+agent runtime during installation.
 
 ## Build the Mac package
 
@@ -212,7 +224,10 @@ The command works on a temporary copy, separately notarizes and staples the
 recorder service, updates only the service ticket covered by the payload
 manifest, reseals and notarizes the outer Installer app, and promotes the
 package only after codesign, stapler, Gatekeeper, and inventory validation all
-pass. It writes `dist/record-<version>-macos-arm64.zip` and fails without
+pass. It promotes `dist/record-<version>-macos-arm64.zip` together with
+`dist/record-<version>-macos-arm64.release.json`, which binds the exact archive
+checksum and size to its source commit, payload manifest, Team ID, and both
+accepted Apple submissions. Publish both files. The command fails without
 stored credentials; the code-signing key alone is not notarization
 authentication.
 
@@ -226,7 +241,7 @@ command is:
 open "dist/macos-arm64/Record Installer.app"
 ```
 
-Without an explicit profile argument, the backend target follows stock Hermes
+Without an explicit profile argument, the backend target follows the retained Hermes
 precedence: Hermes Desktop's persisted primary-profile preference, then
 `~/.hermes/active_profile`, then the default profile. The Desktop ESM goes in
 the one plugin root that the current upstream Desktop loader watches: the
@@ -283,11 +298,15 @@ installed profile uses them. Whole-product cleanup may remove shared components
 only after no Record-enabled profile, active recording, or recorder service
 remains.
 
-The repository currently records the Web Store identity as `assigned`, not
-`published`. While that remains true, the installer deliberately rejects
-`--chrome store`. Use `--chrome none` only for local lifecycle validation on a
-machine whose reviewed native-host registration is already present; it is not
-customer-distribution proof.
+The Web Store item is published at extension version `0.2.2`, while this source
+contains the `0.2.3` update candidate. `npm run package:chrome:release` requires
+a clean Git HEAD and binds that commit to the deterministic ZIP receipt. The Mac
+packager and customer installer reject `--chrome store` until
+`store-identity.json` records the exact approved `0.2.3` version, release ZIP
+SHA-256, and source commit. Do not update those approval fields before the Web
+Store reports the candidate published. Use `--chrome none` only for local
+lifecycle validation on a machine whose reviewed native-host registration is
+already present; it is not customer-distribution proof.
 
 Restart the backend for the work profile just installed so its Python plugin
 routes reload. Hermes Desktop watches its primary profile's
@@ -301,8 +320,10 @@ The packaged extension source is under the selected profile home:
 $PROFILE_HOME/plugins/record/chrome_capture/extension
 ```
 
-The install path registers the manifest's fixed, assigned Web Store identity
-and allows only that extension origin in Chrome's native-messaging manifest.
+The install path registers the manifest's fixed Web Store identity and allows
+only that extension origin in Chrome's native-messaging manifest. Customer
+packaging additionally proves that the embedded extension files reproduce the
+approved Store archive and have not changed since its recorded source commit.
 Restart Chrome after first registration. During local extension development,
 the same directory can be loaded with Chrome's **Load unpacked** flow; its
 manifest key preserves the same extension ID and therefore the same native-
@@ -321,14 +342,18 @@ recorder to invent browser actions.
 
 ## Profiles, Cron, approvals, and Langfuse
 
-Drafting uses the model, provider, keys, and skills of the profile currently
-selected in Hermes Desktop. A profile is the Hermes agent identity; Record
+Drafting uses the Wexpro/Hermes agent for the profile currently selected in
+Desktop, including its model, provider, and credentials. The host limits that
+turn to `skills_list`, `skill_view`, `tool_search`, `tool_describe`, and the
+typed `record_submit_draft` boundary. It does not expose arbitrary tool
+dispatch or side-effecting profile tools while customer recording evidence is
+in the prompt. A profile is the agent identity; Record
 does not add a second agent identifier. Users can select any profile where
 Record is installed and enabled. The profile carried in a Record request is
 only a stale-view guard: the backend accepts its own active profile and
 rejects a mismatched hint instead of crossing profile boundaries.
 
-Job installation dispatches the stock `cronjob` tool. The resulting job appears
+Job installation dispatches the host's upstream-compatible `cronjob` tool. The resulting job appears
 in Hermes' normal Cron view, and executions use normal Hermes sessions, state,
 tool dispatch, and approval behavior. Record keeps only the review and install
 receipts that bind the workflow the user chose to the Hermes-owned job ID.
@@ -338,22 +363,22 @@ dangerous-command decisions and headless Cron policy remain profile settings.
 Stock Cron cannot pause for a person; `cron_mode: deny` blocks a protected
 command and `cron_mode: approve` permits it unattended.
 
-Configure Hermes' bundled Langfuse plugin in every profile that should be
-traced. Profiles may share one Langfuse project or use separate projects; each
-successful Record `ctx.llm` call uses a profile-qualified Hermes session and
-task ID so work remains attributable in a shared project without adding a
-second agent identifier. Related draft, repair, and review traces share the
-workflow/profile session. Record emits only Hermes' standard lifecycle hooks;
-the bundled Langfuse plugin remains the sole trace client and store.
+Configure the bundled Langfuse plugin in every profile that should be traced.
+Profiles may share one Langfuse project or use separate projects. Host-agent
+drafting and any host-LLM clarification turns use Record task/session IDs and
+the host's ordinary lifecycle hooks, so the bundled Langfuse plugin remains
+the sole trace client and store.
 
-Desktop supports both time-backed and event-backed jobs. Record does not add a
+Desktop supports time-backed jobs in any installed local profile and
+event-backed jobs in the Default profile. Record does not add a
 second receiver: it installs a reviewed dynamic subscription into Hermes'
 profile-scoped, HMAC-authenticated webhook surface.
 Matching deliveries use Hermes' native event filtering, replay protection,
 payload templating, skill loading, agent sessions, and delivery behavior.
-Cron continues to own only time-backed workflows. Desktop reports the selected
-profile's receiver readiness and refuses activation until the gateway's
-webhook receiver is live.
+Cron continues to own only time-backed workflows. Because the current gateway
+receiver is rooted in the default home, Record refuses webhook publication in
+named profiles. In Default, it proves both receiver health and that the running
+gateway loaded the exact HMAC-protected route before reporting installation.
 
 ## Runtime data
 

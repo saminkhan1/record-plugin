@@ -1,11 +1,11 @@
 {
   "name": "record-chrome-capture",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "description": "Record Chrome workflow capture extension.",
   "scripts": {
-    "check": "node --check src/background.js && node --check src/causality.js && node --check src/popup.js && node --check src/user-events.js",
+    "check": "node --check src/background.js && node --check src/causality.js && node --check src/popup.js && node --check src/url-sanitizer.js && node --check src/user-events.js",
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {

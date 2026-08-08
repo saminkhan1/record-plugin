@@ -380,6 +380,15 @@ private struct HermesRecorderServiceApp {
         let parsed = CLIOptions.parse(Array(CommandLine.arguments.dropFirst()))
         let locations = RecorderLocations.resolve(rootArg: parsed.options.root, socketArg: parsed.options.socket)
         let store = EventStreamStore(rootDirectory: locations.root)
+        do {
+            try store.reconcileStartupState()
+        } catch {
+            fputs(
+                "Hermes recorder service refused unreconciled event state: \(String(describing: error))\n",
+                stderr
+            )
+            return
+        }
         let coordinator = RecorderServiceCoordinator(store: store)
         let socketPath = locations.socketPath
 

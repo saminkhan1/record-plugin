@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -67,7 +68,7 @@ def test_planner_publishes_one_typed_submission_tool():
     assert "$ref" not in str(submit["parameters"])
 
 
-def test_submission_stores_complete_hermes_job_spec_and_stable_script_path():
+def test_submission_stores_complete_hermes_job_spec_and_content_addressed_script():
     task_id = "record:planner:canonical-job"
     session = _begin(task_id)
     try:
@@ -83,7 +84,8 @@ def test_submission_stores_complete_hermes_job_spec_and_stable_script_path():
     assert spec["name"] == "Inbox cleanup"
     assert spec["schedule"] == "0 9 * * *"
     assert spec["deliver"] == "local"
-    assert spec["script"] == "record/workflow123/run.py"
+    digest = hashlib.sha256(b"print('ok')\n").hexdigest()
+    assert spec["script"] == f"record/workflow123/{digest}/run.py"
     assert spec["no_agent"] is True
 
 
@@ -98,7 +100,7 @@ def test_parallel_planning_contract_is_rejected():
         )
 
 
-def test_author_workflow_uses_host_agent_and_only_pins_submission_tool(
+def test_author_workflow_uses_host_enforced_draft_tool_allowlist(
     tmp_path, monkeypatch
 ):
     calls = []
@@ -129,13 +131,20 @@ def test_author_workflow_uses_host_agent_and_only_pins_submission_tool(
     )
 
     assert calls[0]["required_tools"] == ["record_submit_draft"]
+    assert calls[0]["allowed_tools"] == [
+        "skills_list",
+        "skill_view",
+        "tool_search",
+        "tool_describe",
+        "record_submit_draft",
+    ]
     assert calls[0]["full_capabilities"] is False
     assert calls[0]["max_iterations"] == 24
     assert result["job_spec"]["schedule"] == "0 9 * * *"
     assert result["job_spec"]["name"] == "Inbox cleanup"
 
 
-def test_submit_draft_rejects_invalid_contract_without_crossing_boundary():
+def test_submit_draft_rejects_invalid_contract_and_accepts_correction_in_session():
     task_id = "record:planner:invalid-draft"
     session = _begin(task_id)
     try:
@@ -146,6 +155,12 @@ def test_submit_draft_rejects_invalid_contract_without_crossing_boundary():
         assert json.loads(result)["success"] is False
         assert "violates the Record draft contract" in result
         assert session.submitted is None
+        corrected = planner.submit_draft(
+            {"plan": _agent_plan()},
+            task_id=task_id,
+        )
+        assert json.loads(corrected)["success"] is True
+        assert session.submitted is not None
     finally:
         planner.finish(task_id)
 

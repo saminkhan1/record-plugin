@@ -3,7 +3,7 @@
   "label": "Workflows",
   "description": "Backend routes for the Record Desktop workflow recorder",
   "icon": "Workflow",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "tab": {
     "path": "/workflows",
     "position": "after:cron",

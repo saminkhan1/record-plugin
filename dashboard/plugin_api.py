@@ -750,7 +750,17 @@ def active_recording(profile: str = ""):
 
 @router.get("/webhook-status")
 def get_webhook_status(profile: str = ""):
-    _profile_name, home = _cron_profile_home(profile)
+    profile_name, home = _cron_profile_home(profile)
+    if profile_name != "default":
+        return {
+            "enabled": False,
+            "configured": False,
+            "ready": False,
+            "reason": (
+                "Webhook workflows can currently be turned on only in the "
+                "Default profile."
+            ),
+        }
     modules = load_record_modules()
     try:
         return modules["hermes"].webhook_runtime_status(hermes_home=home)
@@ -1380,6 +1390,15 @@ def _schedule_recording_locked(
             )
 
     if run_mode == "webhook" and body.publish:
+        if profile_name != "default":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Webhook workflows can currently be turned on only in the "
+                    "Default profile. Reopen Workflows in Default and review "
+                    "the workflow there."
+                ),
+            )
         try:
             webhook_status = modules["hermes"].webhook_runtime_status(
                 hermes_home=home

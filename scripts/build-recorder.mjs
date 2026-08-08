@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { requireReleaseSource, validateProductVersions } from './release-contract.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const sourceRoot = path.join(repoRoot, 'native', 'recorder-service')
@@ -12,7 +13,7 @@ const defaultOutput = path.join(repoRoot, 'dist', 'recorder-macos-arm64')
 const clientIdentifier = 'com.hermes.recorder.client'
 const serviceIdentifier = 'com.hermes.recorder.service'
 const installerIdentifier = 'com.hermes.record.installer'
-const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'))
+const productVersions = validateProductVersions(repoRoot)
 
 function argument(args, name, fallback = '') {
   const index = args.indexOf(name)
@@ -116,6 +117,9 @@ if (!fs.statSync(path.join(sourceRoot, 'Package.swift'), { throwIfNoEntry: false
 }
 
 const release = process.env.HERMES_RELEASE_BUILD === '1'
+const releaseSource = release
+  ? requireReleaseSource(repoRoot, productVersions.version)
+  : null
 const identity = signingIdentity({ release })
 const teamId = identity.match(/\(([A-Z0-9]+)\)$/)?.[1] || ''
 if (release && !teamId) {
@@ -177,16 +181,27 @@ run('/usr/bin/codesign', ['--verify', '--strict', '--verbose=4', stagedClient])
 run('/usr/bin/codesign', ['--verify', '--deep', '--strict', '--verbose=4', serviceApp])
 run('/usr/bin/codesign', ['--verify', '--strict', '--verbose=4', stagedInstaller])
 
+if (release) {
+  const finalSource = requireReleaseSource(repoRoot, productVersions.version)
+  if (
+    finalSource.commit !== releaseSource.commit ||
+    finalSource.tag !== releaseSource.tag
+  ) {
+    throw new Error('Record release source changed while building the native recorder')
+  }
+}
+
 const receipt = {
   schemaVersion: 2,
   product: 'record',
-  version: String(packageJson.version),
+  version: productVersions.version,
   platform: 'darwin',
   arch: 'arm64',
   configuration,
   release,
   signingIdentity: identity === '-' ? 'adhoc' : identity,
   teamId,
+  ...(releaseSource ? { source: releaseSource } : {}),
   identifiers: {
     client: clientIdentifier,
     service: serviceIdentifier

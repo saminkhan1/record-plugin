@@ -125,7 +125,7 @@ final class ActiveSurfaceRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @
     }
 
     func observe(context: JSONDict, reason: String) {
-        let context = SurfaceJSONBox(context)
+        let context = SurfaceJSONBox(RecorderURLSanitizer.sanitizePayload(context))
         queue.async { [weak self] in
             self?.requestSurface(context: context.value, reason: reason)
         }

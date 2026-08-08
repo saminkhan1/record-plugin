@@ -50,9 +50,9 @@ def complete_structured(
 
     ``ctx.llm`` deliberately owns provider routing and credentials. Hermes
     does not yet emit lifecycle events for plugin-owned completions itself, so
-    Record publishes the same public ``pre_api_request`` /
-    ``post_api_request`` events around its own call. The enabled stock
-    observability plugin remains the only trace backend.
+    Record publishes the same public request and terminal events around its
+    own call. The enabled stock observability plugin remains the only trace
+    backend.
     """
 
     context = _plugin_context()
@@ -68,41 +68,95 @@ def complete_structured(
         f"record:profile={_trace_token(profile, 48)}:"
         f"workflow={_trace_token(scope, 96)}"
     )
+    common = {
+        "task_id": task_id,
+        "session_id": session_id,
+        "profile_id": profile,
+        "profile_home": profile_home,
+        "turn_id": request_id,
+        "api_request_id": request_id,
+        "api_call_count": 1,
+        "platform": "plugin",
+        "provider": "",
+        "model": "",
+        "api_mode": "plugin",
+    }
+    trace_messages = _trace_messages(kwargs)
+    request_body: dict[str, Any] = {"messages": trace_messages}
+    if kwargs.get("max_tokens") is not None:
+        request_body["max_tokens"] = kwargs["max_tokens"]
     started = time.monotonic()
+    lifecycle_opened = _invoke_llm_hook(
+        "pre_api_request",
+        **common,
+        request={"method": "POST", "body": request_body},
+        message_count=len(trace_messages),
+        tool_count=0,
+        max_tokens=kwargs.get("max_tokens"),
+    )
     try:
         result = context.llm.complete_structured(**kwargs)
-    except Exception:
-        # Stock Langfuse does not consume a terminal plugin-request error hook.
-        # Do not synthesize a success-shaped trace for a failed completion.
-        log.debug("Record ctx.llm call failed before trace publication", exc_info=True)
+    except Exception as exc:
+        if lifecycle_opened:
+            _invoke_llm_hook(
+                "api_request_error",
+                **common,
+                api_duration=max(0.0, time.monotonic() - started),
+                error={
+                    "type": type(exc).__name__,
+                    "message": "Plugin LLM request failed",
+                },
+                reason="plugin_llm_error",
+                retryable=False,
+            )
+            _invoke_llm_hook(
+                "on_session_end",
+                **_terminal_llm_payload(common),
+                completed=False,
+                failed=True,
+                interrupted=False,
+                turn_exit_reason=f"exception:{type(exc).__name__}",
+                final_response=None,
+            )
+        log.debug("Record ctx.llm call failed", exc_info=True)
         raise
 
-    usage = getattr(result, "usage", None)
-    _publish_llm_lifecycle(
-        kwargs=kwargs,
-        task_id=task_id,
-        session_id=session_id,
-        profile=profile,
-        profile_home=profile_home,
-        request_id=request_id,
-        provider=str(getattr(result, "provider", "") or ""),
-        model=str(getattr(result, "model", "") or ""),
-        duration=time.monotonic() - started,
-        text=str(getattr(result, "text", "") or ""),
-        usage={
-            key: value
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "total_tokens",
-                "cache_read_tokens",
-                "cache_write_tokens",
-                "cost_usd",
-            )
-            if (value := getattr(usage, key, None)) is not None
-        },
-        finish_reason="stop",
-    )
+    if lifecycle_opened:
+        usage = getattr(result, "usage", None)
+        common.update(
+            provider=str(getattr(result, "provider", "") or ""),
+            model=str(getattr(result, "model", "") or ""),
+        )
+        trace_text = str(getattr(result, "text", "") or "") or "[empty response]"
+        _invoke_llm_hook(
+            "post_api_request",
+            **common,
+            api_duration=max(0.0, time.monotonic() - started),
+            usage={
+                key: value
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "cost_usd",
+                )
+                if (value := getattr(usage, key, None)) is not None
+            },
+            assistant_response=trace_text,
+            assistant_content_chars=len(trace_text),
+            assistant_tool_call_count=0,
+        )
+        _invoke_llm_hook(
+            "on_session_end",
+            **_terminal_llm_payload(common),
+            completed=True,
+            failed=False,
+            interrupted=False,
+            turn_exit_reason="plugin_llm_completed",
+            final_response=trace_text,
+        )
     return result
 
 
@@ -115,14 +169,15 @@ def run_agent(
     tool_progress_callback: Any = None,
     status_callback: Any = None,
     required_tools: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
     full_capabilities: bool = False,
     purpose: str = "workflow.draft",
 ) -> dict[str, Any]:
-    """Run one full-capability, host-owned Hermes agent turn.
+    """Run one host-owned Hermes agent turn with the requested tool scope.
 
     ``ctx.agent`` resolves the active profile's model, provider, credentials,
-    fallback, normal toolsets, skills, and MCP catalog. Record supplies only
-    the ephemeral planning prompt and task correlation id.
+    and fallback. Record supplies the ephemeral planning prompt, task
+    correlation id, and any explicit host-enforced tool boundary.
     """
 
     context = _plugin_context()
@@ -134,6 +189,7 @@ def run_agent(
         tool_progress_callback=tool_progress_callback,
         status_callback=status_callback,
         required_tools=required_tools,
+        allowed_tools=allowed_tools,
         full_capabilities=full_capabilities,
         purpose=purpose,
     )
@@ -142,61 +198,35 @@ def run_agent(
     return result
 
 
-def _publish_llm_lifecycle(
-    *,
-    kwargs: dict[str, Any],
-    task_id: str,
-    session_id: str,
-    profile: str,
-    profile_home: str,
-    request_id: str,
-    provider: str,
-    model: str,
-    duration: float,
-    text: str,
-    usage: dict[str, Any],
-    finish_reason: str,
-) -> None:
-    """Publish one completed plugin call without owning an observer client."""
+def _invoke_llm_hook(name: str, **payload: Any) -> bool:
+    """Publish one lifecycle hook without changing the plugin operation."""
 
     try:
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.lifecycle import invoke_hook
 
-        common = {
-            "task_id": task_id,
-            "session_id": session_id,
-            "profile_id": profile,
-            "profile_home": profile_home,
-            "turn_id": request_id,
-            "api_request_id": request_id,
-            "api_call_count": 1,
-            "platform": "plugin",
-            "provider": provider,
-            "model": model,
-            "api_mode": "plugin",
-        }
-        invoke_hook(
-            "pre_api_request",
-            **common,
-            request_messages=_trace_messages(kwargs),
-            message_count=2,
-            max_tokens=kwargs.get("max_tokens"),
-        )
-        trace_text = text or "[empty response]"
-        invoke_hook(
-            "post_api_request",
-            **common,
-            api_duration=max(0.0, duration),
-            finish_reason=finish_reason,
-            usage=usage,
-            assistant_response=trace_text,
-            assistant_content_chars=len(trace_text),
-            assistant_tool_call_count=0,
-        )
+        invoke_hook(name, **payload)
+        return True
     except Exception:
         # Observability is fail-open in Hermes. A trace backend must never
         # change whether the reviewed workflow can be drafted.
-        return
+        return False
+
+
+def _terminal_llm_payload(common: dict[str, Any]) -> dict[str, Any]:
+    """Return the turn identity used by the host terminal lifecycle."""
+
+    return {
+        key: common[key]
+        for key in (
+            "task_id",
+            "session_id",
+            "profile_id",
+            "profile_home",
+            "turn_id",
+            "platform",
+            "model",
+        )
+    }
 
 
 def _trace_token(value: str, max_chars: int) -> str:

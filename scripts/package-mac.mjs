@@ -5,6 +5,13 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { buildChromeArchive, chromePackageFiles } from './package-chrome.mjs'
+import {
+  requirePublishedChromeSource,
+  requireReleaseSource,
+  validateChromeExtensionIdentity,
+  validateProductVersions
+} from './release-contract.mjs'
 import { runtimeFiles, validateRuntimeFiles } from './runtime-files.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -43,16 +50,6 @@ function copyFile(relativePath, destinationRoot = pythonPluginRoot) {
   fs.mkdirSync(path.dirname(destination), { recursive: true })
   fs.copyFileSync(source, destination)
   fs.chmodSync(destination, fs.statSync(source).mode & 0o777)
-}
-
-function extensionIdFromKey(publicKey) {
-  const digest = createHash('sha256')
-    .update(Buffer.from(publicKey, 'base64'))
-    .digest()
-    .subarray(0, 16)
-  return [...digest.toString('hex')]
-    .map(character => String.fromCharCode('a'.charCodeAt(0) + Number.parseInt(character, 16)))
-    .join('')
 }
 
 function filesUnder(root, current = root) {
@@ -150,22 +147,18 @@ if (!/^[A-Z0-9]{10}$/.test(expectedTeamId)) {
   throw new Error('package:mac requires a valid 10-character APPLE_TEAM_ID')
 }
 
-const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'))
-const extensionManifest = JSON.parse(
-  fs.readFileSync(path.join(repoRoot, 'chrome_capture', 'extension', 'manifest.json'), 'utf8')
+const productVersions = validateProductVersions(repoRoot)
+const releaseSource = requireReleaseSource(repoRoot, productVersions.version)
+const chrome = validateChromeExtensionIdentity(repoRoot, { requirePublishedVersion: true })
+requirePublishedChromeSource(repoRoot, chrome, chromePackageFiles)
+const { archive: chromeArchive } = buildChromeArchive(
+  path.join(repoRoot, 'chrome_capture', 'extension')
 )
-const storeIdentity = JSON.parse(
-  fs.readFileSync(path.join(repoRoot, 'chrome_capture', 'extension', 'store-identity.json'), 'utf8')
-)
-const extensionId = extensionIdFromKey(String(extensionManifest.key || ''))
-const extensionVersion = String(extensionManifest.version || '').trim()
-if (
-  storeIdentity.schemaVersion !== 1 ||
-  !['assigned', 'published'].includes(storeIdentity.status) ||
-  storeIdentity.extensionId !== extensionId ||
-  !/^\d+(?:\.\d+){0,3}$/.test(extensionVersion)
-) {
-  throw new Error('Chrome Web Store identity or version is invalid for the extension manifest')
+const chromeArchiveSha256 = createHash('sha256').update(chromeArchive).digest('hex')
+if (chromeArchiveSha256 !== chrome.publishedArchiveSha256) {
+  throw new Error(
+    `Packaged Chrome bytes do not match the approved Store archive ${chrome.publishedArchiveSha256}`
+  )
 }
 
 const recorderManifest = JSON.parse(
@@ -174,12 +167,14 @@ const recorderManifest = JSON.parse(
 if (
   recorderManifest.schemaVersion !== 2 ||
   recorderManifest.product !== 'record' ||
-  recorderManifest.version !== String(packageJson.version) ||
+  recorderManifest.version !== productVersions.version ||
   recorderManifest.release !== true ||
   recorderManifest.platform !== 'darwin' ||
   recorderManifest.arch !== 'arm64' ||
   typeof recorderManifest.teamId !== 'string' ||
   recorderManifest.teamId !== expectedTeamId ||
+  recorderManifest.source?.commit !== releaseSource.commit ||
+  recorderManifest.source?.tag !== releaseSource.tag ||
   recorderManifest.installerLauncher?.identifier !== 'com.hermes.record.installer' ||
   recorderManifest.installerLauncher?.path !== 'record-installer' ||
   recorderManifest.installerLauncher?.sha256 !==
@@ -199,6 +194,12 @@ for (const target of [
 ]) {
   if (!fs.existsSync(target)) throw new Error(`Required build output is missing: ${target}`)
 }
+if (
+  sha256(path.join(repoRoot, 'desktop-plugin', 'plugin.js')) !==
+  sha256(path.join(repoRoot, 'desktop-plugin', 'dist', 'record', 'plugin.js'))
+) {
+  throw new Error('Desktop plugin build output does not match its reviewed source')
+}
 for (const target of [
   path.join(recorderRoot, 'hermes-recorder'),
   path.join(recorderRoot, 'Hermes Recorder Service.app', 'Contents', 'MacOS', 'hermes-recorder-service'),
@@ -212,6 +213,7 @@ for (const target of [
   path.join(repoRoot, 'chrome_capture', 'extension', 'src', 'background.js'),
   path.join(repoRoot, 'chrome_capture', 'extension', 'src', 'causality.js'),
   path.join(repoRoot, 'chrome_capture', 'extension', 'src', 'popup.js'),
+  path.join(repoRoot, 'chrome_capture', 'extension', 'src', 'url-sanitizer.js'),
   path.join(repoRoot, 'chrome_capture', 'extension', 'src', 'user-events.js')
 ]) {
   checkJavaScript(target)
@@ -220,6 +222,14 @@ checkPython(path.join(repoRoot, 'scripts', 'install-mac.py'))
 
 fs.rmSync(outputRoot, { recursive: true, force: true })
 for (const relativePath of runtimeFiles) copyFile(relativePath)
+for (const relativePath of runtimeFiles) {
+  if (
+    sha256(path.join(repoRoot, relativePath)) !==
+    sha256(path.join(pythonPluginRoot, relativePath))
+  ) {
+    throw new Error(`Record runtime source changed while packaging: ${relativePath}`)
+  }
+}
 
 fs.mkdirSync(packagedRecorder, { recursive: true })
 fs.copyFileSync(
@@ -267,9 +277,9 @@ const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>${String(packageJson.version)}</string>
+  <string>${productVersions.version}</string>
   <key>CFBundleVersion</key>
-  <string>${String(packageJson.version)}</string>
+  <string>${productVersions.version}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>LSUIElement</key>
@@ -285,30 +295,36 @@ const files = filesUnder(packagePayloadRoot)
 const manifest = {
   schemaVersion: 3,
   name: 'record',
-  version: String(packageJson.version),
+  version: productVersions.version,
   platform: 'darwin',
   arch: 'arm64',
   release: true,
   signingIdentity: recorderManifest.signingIdentity,
   teamId: recorderManifest.teamId,
+  source: releaseSource,
   pythonPlugin: 'plugins/record',
   desktopPlugin: 'desktop-plugins/record',
   recorderClient: 'native/hermes-recorder/hermes-recorder',
   installer: 'scripts/install-mac.py',
   chromeExtension: 'plugins/record/chrome_capture/extension',
-  chromeExtensionId: extensionId,
-  chromeExtensionVersion: extensionVersion,
-  chromeStoreStatus: storeIdentity.status,
+  chromeExtensionId: chrome.extensionId,
+  chromeExtensionVersion: chrome.version,
+  chromeStoreStatus: 'published',
+  chromePublishedVersion: chrome.publishedVersion,
+  chromePublishedSourceCommit: chrome.publishedSourceCommit,
+  chromeExtensionArchiveSha256: chromeArchiveSha256,
   distribution: {
     customerEntry: installerAppName,
     notarization: 'release-gate'
   },
   requiredHermesCapabilities: [
     'plugin_llm',
+    'plugin_agent',
     'plugin_profile',
     'plugin_tool_dispatch',
     'builtin_tool_discovery',
-    'plugin_hooks'
+    'plugin_hooks',
+    'atomic_webhook_mutation'
   ],
   files: Object.fromEntries(
     files.map(relativePath => [
@@ -321,6 +337,13 @@ fs.writeFileSync(
   path.join(packagePayloadRoot, 'manifest.json'),
   `${JSON.stringify(manifest, null, 2)}\n`
 )
+const finalSource = requireReleaseSource(repoRoot, productVersions.version)
+if (
+  finalSource.commit !== releaseSource.commit ||
+  finalSource.tag !== releaseSource.tag
+) {
+  throw new Error('Record release source changed while packaging')
+}
 signInstallerApp(installerApp, recorderManifest.signingIdentity)
 requireReleaseSignature(installerApp, recorderManifest.teamId)
 const verifyInstaller = spawnSync(
@@ -362,7 +385,9 @@ if (hasBackup) {
 console.log(JSON.stringify({
   outputRoot: finalOutputRoot,
   version: manifest.version,
+  source: manifest.source,
   files: files.length,
-  chromeExtensionId: extensionId,
-  chromeExtensionVersion: extensionVersion
+  chromeExtensionId: chrome.extensionId,
+  chromeExtensionVersion: chrome.version,
+  chromeExtensionArchiveSha256: chromeArchiveSha256
 }, null, 2))

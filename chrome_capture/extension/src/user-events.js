@@ -223,7 +223,8 @@
   function emit(type, event) {
     if (!captureAuthorityActive) return;
     try {
-      extensionRuntime.sendMessage({ type, event }, (response) => {
+      const message = globalThis.HermesURLSanitizer.sanitizeValue({ type, event });
+      extensionRuntime.sendMessage(message, (response) => {
         const runtimeError = extensionRuntime.lastError;
         if (runtimeError || response?.ok !== true) {
           console.warn("Hermes Chrome Provider did not persist capture event", type, runtimeError?.message || response?.error || "unknown error");

@@ -57,11 +57,19 @@ public final class EventStreamStore: @unchecked Sendable {
     public let rootDirectory: URL
     private let fileManager = FileManager.default
     private let lock = NSLock()
+    private let startupLock = NSLock()
+    private var startupReconciled = false
     private let captureStateSchema = "hermes-adaptive-capture-v1"
     private let chromeHeartbeatFreshSeconds: TimeInterval = 5
 
     public init(rootDirectory: URL) {
         self.rootDirectory = rootDirectory
+    }
+
+    /// Repair durable counters from JSONL before this service instance can
+    /// append. A malformed or ambiguous stream is preserved and fails closed.
+    public func reconcileStartupState() throws {
+        try ensureRoot()
     }
 
     public func start(maxDurationSeconds: Int = 1800) throws -> JSONDict {
@@ -319,7 +327,7 @@ public final class EventStreamStore: @unchecked Sendable {
                     "ts": event.timestamp,
                     "monotonic_ns": event.monotonicNanoseconds,
                     "kind": event.kind,
-                    "payload": event.payload,
+                    "payload": RecorderURLSanitizer.sanitizePayload(event.payload),
                 ]
                 let url = rawURL(sessionDirectory, stream: event.stream)
                 dataByURL[url, default: Data()].append(try RecorderJSON.encodeLine(row))
@@ -373,7 +381,7 @@ public final class EventStreamStore: @unchecked Sendable {
                 "type": type,
                 "source": source,
                 "kind": kind,
-                "payload": payload,
+                "payload": RecorderURLSanitizer.sanitizePayload(payload),
                 "quality": quality.isEmpty ? ["confidence": "medium", "warnings": []] : quality,
             ]
             try append(row, to: traceURL(sessionDirectory))
@@ -806,7 +814,7 @@ public final class EventStreamStore: @unchecked Sendable {
             windowPayload = window
         }
         if let url = browserURL(bundleIdentifier: app.bundleIdentifier, pid: pid) {
-            windowPayload["url"] = url
+            windowPayload["url"] = RecorderURLSanitizer.sanitize(url)
         }
         return [
             "app": appPayload,
@@ -1028,6 +1036,13 @@ public final class EventStreamStore: @unchecked Sendable {
         } catch {
             throw RecorderError.filesystem("Unable to create \(rootDirectory.path): \(error)")
         }
+        startupLock.lock()
+        defer { startupLock.unlock() }
+        guard !startupReconciled else { return }
+        if let sessionDirectory = try activeSessionDirectory() {
+            try reconcileDurableEventState(sessionDirectory)
+        }
+        startupReconciled = true
     }
 
     private func append(_ object: JSONDict, to url: URL) throws {
@@ -1058,7 +1073,10 @@ public final class EventStreamStore: @unchecked Sendable {
     }
 
     private func write(_ object: JSONDict, to url: URL) throws {
-        let data = try RecorderJSON.encode(object, pretty: true)
+        let data = try RecorderJSON.encode(
+            RecorderURLSanitizer.sanitizePayload(object),
+            pretty: true
+        )
         try data.write(to: url, options: [.atomic])
     }
 
@@ -1084,6 +1102,127 @@ public final class EventStreamStore: @unchecked Sendable {
         let data = try Data(contentsOf: url)
         if data.isEmpty { return 0 }
         return data.split(separator: 0x0a).filter { !$0.isEmpty }.count
+    }
+
+    private struct JSONLScan {
+        let count: Int
+        let maximumIdentifier: Int
+    }
+
+    private func scanJSONL(
+        _ url: URL,
+        label: String,
+        identifierKey: String,
+        visit: (Int, Int) throws -> Void
+    ) throws -> JSONLScan {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            throw RecorderError.filesystem(
+                "Unable to read \(label) JSONL at \(url.path): \(error)"
+            )
+        }
+        var count = 0
+        var maximumIdentifier = 0
+        let lines = data.split(separator: 0x0a, omittingEmptySubsequences: false)
+        for (offset, line) in lines.enumerated() {
+            if line.isEmpty {
+                if offset == lines.count - 1 { continue }
+                throw RecorderError.filesystem(
+                    "Malformed \(label) JSONL at line \(offset + 1): blank rows are not recoverable"
+                )
+            }
+            let row: JSONDict
+            do {
+                row = try RecorderJSON.decodeDict(Data(line))
+            } catch {
+                throw RecorderError.filesystem(
+                    "Malformed \(label) JSONL at line \(offset + 1); refusing to discard durable evidence"
+                )
+            }
+            let identifier: Int
+            if let value = row[identifierKey] as? Int {
+                identifier = value
+            } else if let value = row[identifierKey] as? NSNumber,
+                      value.doubleValue == Double(value.intValue)
+            {
+                identifier = value.intValue
+            } else {
+                identifier = 0
+            }
+            guard identifier > 0 else {
+                throw RecorderError.filesystem(
+                    "Malformed \(label) JSONL at line \(offset + 1): missing positive \(identifierKey)"
+                )
+            }
+            try visit(identifier, offset + 1)
+            count += 1
+            maximumIdentifier = max(maximumIdentifier, identifier)
+        }
+        return JSONLScan(count: count, maximumIdentifier: maximumIdentifier)
+    }
+
+    private func reconcileDurableEventState(_ sessionDirectory: URL) throws {
+        try withTraceFileLock(sessionDirectory) {
+            var metadata = try readJSON(metadataURL(sessionDirectory))
+            var previousTraceID = 0
+            let trace = try scanJSONL(
+                traceURL(sessionDirectory),
+                label: "trace",
+                identifierKey: "id"
+            ) { identifier, line in
+                guard identifier == previousTraceID + 1 else {
+                    throw RecorderError.filesystem(
+                        "Ambiguous trace JSONL at line \(line): expected id \(previousTraceID + 1), found \(identifier)"
+                    )
+                }
+                previousTraceID = identifier
+            }
+
+            var seenRawSequences = Set<Int>()
+            var rawMaximumSequence = 0
+            var rawCounts: JSONDict = [:]
+            for stream in [
+                RawEventStream.input,
+                .context,
+                .activeSurface,
+                .frames,
+            ] {
+                let countKey = rawCountKey(stream)
+                var previousStreamSequence = 0
+                let scan = try scanJSONL(
+                    rawURL(sessionDirectory, stream: stream),
+                    label: "raw \(countKey)",
+                    identifierKey: "seq"
+                ) { identifier, line in
+                    guard identifier > previousStreamSequence else {
+                        throw RecorderError.filesystem(
+                            "Ambiguous raw \(countKey) JSONL at line \(line): sequence \(identifier) is not increasing"
+                        )
+                    }
+                    guard seenRawSequences.insert(identifier).inserted else {
+                        throw RecorderError.filesystem(
+                            "Ambiguous raw JSONL sequence \(identifier) at \(countKey) line \(line)"
+                        )
+                    }
+                    previousStreamSequence = identifier
+                }
+                rawCounts[countKey] = scan.count
+                rawMaximumSequence = max(rawMaximumSequence, scan.maximumIdentifier)
+            }
+
+            metadata["eventCount"] = trace.maximumIdentifier
+            // rawEventCount is the durable global sequence high-water mark;
+            // per-stream fields retain actual persisted row counts.
+            metadata["rawEventCount"] = rawMaximumSequence
+            metadata["rawEventCounts"] = rawCounts
+            metadata["rawInputEventCount"] = rawCounts["input"] ?? 0
+            metadata["rawContextEventCount"] = rawCounts["context"] ?? 0
+            metadata["rawActiveSurfaceEventCount"] = rawCounts["activeSurface"] ?? 0
+            metadata["visualFrameEventCount"] = rawCounts["frames"] ?? 0
+            try write(metadata, to: metadataURL(sessionDirectory))
+        }
     }
 
     private func metadataURL(_ sessionDirectory: URL) -> URL {

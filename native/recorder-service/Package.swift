@@ -41,5 +41,9 @@ let package = Package(
                 .linkedFramework("AppKit")
             ]
         ),
+        .testTarget(
+            name: "HermesRecorderCoreTests",
+            dependencies: ["HermesRecorderCore"]
+        ),
     ]
 )

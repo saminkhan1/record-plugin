@@ -60,7 +60,7 @@ final class RawEventBuffer: @unchecked Sendable {
         let event = RawEventRecord(
             stream: stream,
             kind: kind,
-            payload: payload,
+            payload: RecorderURLSanitizer.sanitizePayload(payload),
             timestamp: "",
             monotonicNanoseconds: monotonicNanoseconds
         )

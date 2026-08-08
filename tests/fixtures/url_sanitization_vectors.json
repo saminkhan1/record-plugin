@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "credential_query_and_oauth_route_fragment",
+      "input": "https://user:password@example.test/callback?view=receipt&access_token=opaque&id_token=id-secret&apiKey=api-secret&csrfmiddlewaretoken=csrf-long&csrftoken=csrf-short&session_id=s123&monkey=banana&zipcode=10001#/complete?tab=summary&refreshToken=fragment-secret&state=keep",
+      "expected": "https://example.test/callback?view=receipt&access_token=%5BREDACTED%5D&id_token=%5BREDACTED%5D&apiKey=%5BREDACTED%5D&csrfmiddlewaretoken=%5BREDACTED%5D&csrftoken=%5BREDACTED%5D&session_id=%5BREDACTED%5D&monkey=banana&zipcode=10001#/complete?tab=summary&refreshToken=%5BREDACTED%5D&state=keep"
+    },
+    {
+      "name": "credential_query_like_fragment",
+      "input": "https://example.test/callback?view=receipt&monkey=banana#tab=summary&access_token=fragment-secret&id_token=id-secret&zipcode=10001",
+      "expected": "https://example.test/callback?view=receipt&monkey=banana#tab=summary&access_token=%5BREDACTED%5D&id_token=%5BREDACTED%5D&zipcode=10001"
+    },
+    {
+      "name": "ordinary_query_and_fragment_are_byte_stable",
+      "input": "https://example.test/report?quarter=Q3&page=2&empty=&monkey=banana&zipcode=10001#totals?quarter=Q3&monkey=banana&zipcode=10001",
+      "expected": "https://example.test/report?quarter=Q3&page=2&empty=&monkey=banana&zipcode=10001#totals?quarter=Q3&monkey=banana&zipcode=10001"
+    },
+    {
+      "name": "userinfo_is_removed_without_rewriting_safe_suffix",
+      "input": "https://user:p%40ss@example.test/report?quarter=Q3&empty=#totals",
+      "expected": "https://example.test/report?quarter=Q3&empty=#totals"
+    },
+    {
+      "name": "mixed_secret_query_preserves_nonsecret_encoding",
+      "input": "https://example.test/search?q=a%20b&empty=&access_token=opaque&plus=a+b&encoded=%2f%2F#done?tab=a%20b&refreshToken=fragment-secret&state=a+b",
+      "expected": "https://example.test/search?q=a%20b&empty=&access_token=%5BREDACTED%5D&plus=a+b&encoded=%2f%2F#done?tab=a%20b&refreshToken=%5BREDACTED%5D&state=a+b"
+    },
+    {
+      "name": "mixed_case_base_is_byte_stable",
+      "input": "HtTpS://Example.TEST:443/Path%2f?q=a%20b&access_token=opaque#Done",
+      "expected": "HtTpS://Example.TEST:443/Path%2f?q=a%20b&access_token=%5BREDACTED%5D#Done"
+    },
+    {
+      "name": "malformed_ipv6_authority_does_not_crash",
+      "input": "https://[not-ipv6/path?q=a%20b&access_token=opaque#Done",
+      "expected": "https://[not-ipv6/path?q=a%20b&access_token=%5BREDACTED%5D#Done"
+    },
+    {
+      "name": "signed_url_signatures_are_redacted",
+      "input": "https://storage.example.test/object%2Fname?q=a%20b&signature=direct-secret&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=aws-secret&X-Amz-Security-Token=aws-session-secret&X-Goog-Signature=google-secret&sig=azure-secret&state=keep",
+      "expected": "https://storage.example.test/object%2Fname?q=a%20b&signature=%5BREDACTED%5D&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=%5BREDACTED%5D&X-Amz-Security-Token=%5BREDACTED%5D&X-Goog-Signature=%5BREDACTED%5D&sig=%5BREDACTED%5D&state=keep"
+    },
+    {
+      "name": "semicolon_separators_preserve_safe_fields",
+      "input": "https://example.test/download?q=a%20b;signature=query-secret&state=keep;access_token=token-secret#done?tab=a%20b;X-Amz-Signature=fragment-secret&state=keep",
+      "expected": "https://example.test/download?q=a%20b;signature=%5BREDACTED%5D&state=keep;access_token=%5BREDACTED%5D#done?tab=a%20b;X-Amz-Signature=%5BREDACTED%5D&state=keep"
+    },
+    {
+      "name": "bounded_multi_encoded_secret_keys",
+      "input": "https://example.test/callback?q=a%20b&api%255Fkey=query-secret&safe%255Ffield=keep#api%25255Fkey=fragment-secret&state=keep",
+      "expected": "https://example.test/callback?q=a%20b&api%255Fkey=%5BREDACTED%5D&safe%255Ffield=keep#api%25255Fkey=%5BREDACTED%5D&state=keep"
+    },
+    {
+      "name": "mixed_valid_and_malformed_key_escapes_are_classified",
+      "input": "https://example.test/callback?api%5Fkey%ZZ=malformed-secret&view=public;api%5Fkey%E9=non-ascii-secret&state=keep",
+      "expected": "https://example.test/callback?api%5Fkey%ZZ=%5BREDACTED%5D&view=public;api%5Fkey%E9=%5BREDACTED%5D&state=keep"
+    },
+    {
+      "name": "malformed_no_secret_url_is_byte_stable",
+      "input": "https://example.test/report?view=%E9%ZZ;safe%255Ffield=a%20b&signature_algorithm=v4#totals?tab=%ZZ",
+      "expected": "https://example.test/report?view=%E9%ZZ;safe%255Ffield=a%20b&signature_algorithm=v4#totals?tab=%ZZ"
+    }
+  ]
+}

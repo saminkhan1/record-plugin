@@ -37,6 +37,14 @@ _TEXT_ARTIFACT_SUFFIXES = {".json", ".jsonl", ".md", ".txt", ".yaml", ".yml"}
 _IMAGE_ARTIFACT_SUFFIXES = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _VIDEO_ARTIFACT_SUFFIXES = {".m4v", ".mov", ".mp4"}
 
+_DRAFT_AGENT_ALLOWED_TOOLS = [
+    "skills_list",
+    "skill_view",
+    "tool_search",
+    "tool_describe",
+    "record_submit_draft",
+]
+
 _CLARIFICATION_MODEL_STATES = (
     "needs_input",
     "ready_to_redraft",
@@ -316,6 +324,7 @@ def author_workflow(
                     tool_progress_callback=on_progress,
                     status_callback=on_progress,
                     required_tools=["record_submit_draft"],
+                    allowed_tools=list(_DRAFT_AGENT_ALLOWED_TOOLS),
                     full_capabilities=False,
                     purpose="workflow.draft",
                 )

@@ -1,7 +1,7 @@
 {
   "name": "record-plugin",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "start": "node scripts/dev.mjs",
@@ -10,12 +10,15 @@
     "build:dashboard": "node scripts/build-dashboard.mjs",
     "build:desktop": "npm --prefix desktop-plugin run build",
     "build:recorder": "node scripts/build-recorder.mjs",
+    "test:recorder": "swift test --package-path native/recorder-service --configuration release --arch arm64",
+    "check:versions": "node scripts/release-contract.mjs",
     "package:chrome": "npm run test:chrome && node scripts/package-chrome.mjs",
-    "package:mac": "npm run build && npm run build:recorder && node scripts/package-mac.mjs",
+    "package:chrome:release": "npm run test:chrome && node scripts/package-chrome.mjs --release-source",
+    "package:mac": "npm run build && npm run test:recorder && npm run build:recorder && node scripts/package-mac.mjs",
     "notarize:mac": "node scripts/notarize-mac.mjs",
     "install:mac": "python3 scripts/install-mac.py",
     "test:chrome": "npm --prefix chrome_capture/extension test",
-    "test": "npm run test:chrome"
+    "test": "npm run test:chrome && npm run test:recorder"
   },
   "engines": {
     "node": ">=20"

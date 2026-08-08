@@ -1,12 +1,61 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import re
+from urllib.parse import urlsplit
 
 LEGACY_SCHEMA_VERSION = "hermes-workflow-trace-v2"
 SCHEMA_VERSION = "hermes-workflow-trace-v3"
 SUPPORTED_SCHEMA_VERSIONS = {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}
-SECRET_QUERY_MARKERS = ("token", "auth", "code", "key", "secret", "session", "sid", "jwt", "password", "passwd", "pwd")
+_SECRET_QUERY_TERMS = {
+    "token",
+    "auth",
+    "authorization",
+    "oauth",
+    "oauth2",
+    "code",
+    "key",
+    "secret",
+    "session",
+    "sid",
+    "jwt",
+    "password",
+    "passwd",
+    "pwd",
+}
+_SECRET_QUERY_COMPACT_KEYS = {
+    "accesstoken",
+    "apikey",
+    "apitoken",
+    "authcode",
+    "authtoken",
+    "bearertoken",
+    "clientsecret",
+    "idtoken",
+    "oauthcode",
+    "passcode",
+    "refreshtoken",
+    "sessionid",
+    "sessionkey",
+    "sig",
+    "signature",
+    "xamzsecuritytoken",
+    "xamzsignature",
+    "xgoogsignature",
+}
+_SECRET_QUERY_COMPACT_SUFFIXES = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+)
+_CAMEL_CASE_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+_QUERY_KEY_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
+_QUERY_FIELD_SEPARATOR = re.compile(r"([&;])")
+_PERCENT_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
+_ABSOLUTE_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 TRACE_ACTION_KINDS = {
     "click", "context_menu", "double_click", "type", "change", "submit", "reset",
@@ -30,7 +79,17 @@ PAYLOAD_GROUPS = {
     "session", "app", "window", "browser", "provider", "environment", "meta",
     "target", "input", "effect",
 }
-_URL_KEYS = {"url", "origin", "href", "before_url", "after_url", "frame_url", "top_url", "final_url"}
+_URL_KEYS = {
+    "url",
+    "origin",
+    "href",
+    "before_url",
+    "after_url",
+    "frame_url",
+    "top_url",
+    "final_url",
+    "referrer",
+}
 _TARGET_IDENTIFIERS = {
     "selector", "selectors", "id", "test_id", "name", "label", "role", "ax", "coordinates",
 }
@@ -54,39 +113,151 @@ def supports_schema_version(value: object) -> bool:
 def url_origin(value: object) -> str:
     """Return the URL's scheme and authority, or an empty string."""
 
-    parsed = urlsplit(str(value or ""))
-    return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    try:
+        parsed = urlsplit(str(value or ""))
+        hostname = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return ""
+    if not parsed.scheme or not hostname:
+        return ""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = f"{host}:{port}" if port is not None else host
+    return f"{parsed.scheme.lower()}://{authority}"
 
 
 def http_url_origin(value: object) -> str:
     """Return a canonical HTTP(S) origin, or an empty string."""
 
-    parsed = urlsplit(str(value or ""))
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        parsed = urlsplit(str(value or ""))
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
         return ""
-    return f"{scheme}://{parsed.netloc.lower()}"
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = f"{host}:{port}" if port is not None else host
+    return f"{scheme}://{authority}"
 
 
 def redact_url(value: object) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    parsed = urlsplit(text)
-    if not parsed.scheme and not parsed.netloc:
+    if not _ABSOLUTE_URL_SCHEME.match(text) and not text.startswith("//"):
         return text
-    hostname = parsed.hostname or ""
-    netloc = hostname
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    query = urlencode(
-        [
-            (key, "[REDACTED]" if any(marker in key.lower() for marker in SECRET_QUERY_MARKERS) else val)
-            for key, val in parse_qsl(parsed.query, keep_blank_values=True)
-        ],
-        doseq=True,
+    without_userinfo = _remove_authority_credentials(text)
+    before_fragment, fragment_separator, fragment = without_userinfo.partition("#")
+    base, query_separator, query = before_fragment.partition("?")
+    return "".join(
+        (
+            base,
+            f"?{_redact_query_string(query)}" if query_separator else "",
+            f"#{_redact_fragment(fragment)}" if fragment_separator else "",
+        )
     )
-    return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+
+
+def _remove_authority_credentials(value: str) -> str:
+    if value.startswith("//"):
+        authority_start = 2
+    else:
+        scheme = _ABSOLUTE_URL_SCHEME.match(value)
+        if scheme is None or not value[scheme.end() :].startswith("//"):
+            return value
+        authority_start = scheme.end() + 2
+    authority_end = min(
+        (
+            index
+            for character in "/?#"
+            if (index := value.find(character, authority_start)) >= 0
+        ),
+        default=len(value),
+    )
+    credential_end = value.rfind("@", authority_start, authority_end)
+    if credential_end < 0:
+        return value
+    return value[:authority_start] + value[credential_end + 1 :]
+
+
+def _is_secret_query_key(value: object) -> bool:
+    key = str(value or "").strip()
+    if not key:
+        return False
+    compact = _QUERY_KEY_SEPARATOR.sub("", key).lower()
+    if compact in _SECRET_QUERY_COMPACT_KEYS or compact.endswith(
+        _SECRET_QUERY_COMPACT_SUFFIXES
+    ):
+        return True
+    separated = _CAMEL_CASE_BOUNDARY.sub(" ", key)
+    terms = {
+        term.lower()
+        for term in _QUERY_KEY_SEPARATOR.split(separated)
+        if term
+    }
+    return bool(terms & _SECRET_QUERY_TERMS)
+
+
+def _redact_query_string(value: str) -> str:
+    """Redact credential values while leaving an ordinary query byte-stable."""
+
+    parts = _QUERY_FIELD_SEPARATOR.split(value)
+    if not any(
+        _query_field_has_secret_key(parts[index])
+        for index in range(0, len(parts), 2)
+    ):
+        return value
+    for index in range(0, len(parts), 2):
+        field = parts[index]
+        if _query_field_has_secret_key(field):
+            parts[index] = f"{field.partition('=')[0]}=%5BREDACTED%5D"
+    return "".join(parts)
+
+
+def _query_field_has_secret_key(field: str) -> bool:
+    encoded_key, separator, _value = field.partition("=")
+    if not separator:
+        return False
+    return _is_secret_query_key(_canonical_query_key(encoded_key))
+
+
+def _canonical_query_key(value: str) -> str:
+    """Decode a query key at most three times for classification only."""
+
+    decoded = value
+    for _ in range(3):
+        plus_decoded = decoded.replace("+", " ")
+        next_value = _PERCENT_ESCAPE.sub(
+            lambda match: (
+                chr(byte)
+                if (byte := int(match.group(1), 16)) <= 0x7F
+                else match.group(0)
+            ),
+            plus_decoded,
+        )
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded
+
+
+def _redact_fragment(value: str) -> str:
+    """Redact OAuth/hash-router query values without dropping normal anchors."""
+
+    if not value:
+        return value
+    route, separator, query = value.partition("?")
+    if separator:
+        redacted = _redact_query_string(query)
+        return value if redacted == query else f"{route}?{redacted}"
+    if "=" not in value:
+        return value
+    return _redact_query_string(value)
 
 
 def compact_text(value: object, *, limit: int = 160) -> str:

@@ -535,21 +535,22 @@ public final class EventTapRecorder: @unchecked Sendable {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
         guard acceptingEvents else { return false }
+        let sanitizedPayload = RecorderURLSanitizer.sanitizePayload(payload)
         rawEvents.enqueue(
             .context,
             kind: originalKind,
-            payload: payload
+            payload: sanitizedPayload
         )
-        try? store.updateDesiredCaptureProvider(sessionDirectory, context: payload, reason: originalKind)
+        try? store.updateDesiredCaptureProvider(sessionDirectory, context: sanitizedPayload, reason: originalKind)
         // Every resolved app/window context is authoritative. The surface
         // recorder owns transient-window collapsing and identity deduplication,
         // so routing decisions here must not silently hide legitimate AX,
         // workspace, or active-space transitions from visual capture.
-        let surfaceReason = payload["changeReason"] as? String ?? originalKind
-        activeSurfaceRecorder.observe(context: payload, reason: surfaceReason)
-        let traceKind = traceKind(for: originalKind, payload: payload)
-        var payloadGroups = tracePayload(kind: originalKind, traceKind: traceKind, payload: payload)
-        let quality: JSONDict = payload["provenance"] is JSONDict
+        let surfaceReason = sanitizedPayload["changeReason"] as? String ?? originalKind
+        activeSurfaceRecorder.observe(context: sanitizedPayload, reason: surfaceReason)
+        let traceKind = traceKind(for: originalKind, payload: sanitizedPayload)
+        var payloadGroups = tracePayload(kind: originalKind, traceKind: traceKind, payload: sanitizedPayload)
+        let quality: JSONDict = sanitizedPayload["provenance"] is JSONDict
             ? ["confidence": "medium", "warnings": ["accessibility_observed_action"]]
             : ["confidence": "medium", "warnings": []]
         if traceKind == "window.changed" {
@@ -561,7 +562,7 @@ public final class EventTapRecorder: @unchecked Sendable {
             }
         }
 
-        if shouldRouteAsChromeFallback(kind: originalKind, payload: payload) {
+        if shouldRouteAsChromeFallback(kind: originalKind, payload: sanitizedPayload) {
             do {
                 try store.appendTraceEvent(
                     sessionDirectory,

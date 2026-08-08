@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover - native host can run from a thin env
 
 from .record.trace_schema import (
     normalize_trace_row,
+    redact_url,
     utc_now,
     url_origin,
 )
@@ -954,7 +955,8 @@ class ChromeNativeHost:
 def _active_target_state_from_message(message: Dict[str, Any], *, segment_id: Optional[str] = None) -> Dict[str, Any]:
     active_tab_id = message.get("activeTabId") if message.get("activeTabId") is not None else message.get("tabId")
     active_window_id = message.get("activeWindowId") if message.get("activeWindowId") is not None else message.get("windowId")
-    active_url = message.get("activeUrl") or message.get("url")
+    active_url_value = message.get("activeUrl") or message.get("url")
+    active_url = redact_url(active_url_value) if active_url_value is not None else None
     active_title = message.get("activeTitle") or message.get("title")
     active_target_id = message.get("activeTargetId")
     content_script_ready = bool(message.get("contentScriptReady"))
@@ -1032,6 +1034,8 @@ def _write_capture_state(recording_dir: Path, updates: Dict[str, Any], *, reason
     with _recording_lock(recording_dir):
         state = _read_capture_state(recording_dir)
         state.update(updates)
+        if state.get("activeUrl") is not None:
+            state["activeUrl"] = redact_url(state["activeUrl"])
         state["schemaVersion"] = ADAPTIVE_CAPTURE_SCHEMA
         state["updatedAt"] = utc_now()
         state["reason"] = reason

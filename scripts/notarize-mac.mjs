@@ -92,11 +92,12 @@ function payloadInventory(root) {
 }
 
 function validateManifest(manifest, target) {
+  const source = manifest.source
   if (
     manifest.schemaVersion !== 3 ||
     manifest.name !== 'record' ||
     typeof manifest.version !== 'string' ||
-    !/^[0-9A-Za-z][0-9A-Za-z._+-]*$/.test(manifest.version) ||
+    !/^\d+\.\d+\.\d+$/.test(manifest.version) ||
     manifest.release !== true ||
     manifest.platform !== 'darwin' ||
     manifest.arch !== 'arm64' ||
@@ -105,6 +106,12 @@ function validateManifest(manifest, target) {
     !manifest.signingIdentity ||
     typeof manifest.teamId !== 'string' ||
     !/^[A-Z0-9]{10}$/.test(manifest.teamId) ||
+    !source ||
+    typeof source !== 'object' ||
+    Array.isArray(source) ||
+    typeof source.commit !== 'string' ||
+    !/^[0-9a-f]{40}$/.test(source.commit) ||
+    source.tag !== `v${manifest.version}` ||
     !manifest.files ||
     typeof manifest.files !== 'object' ||
     Array.isArray(manifest.files)
@@ -288,7 +295,10 @@ function signInstallerApp(target, identity) {
 function promoteRelease({
   stagedPackageRoot,
   stagedArtifact,
-  artifact
+  artifact,
+  stagedReceipt,
+  receipt,
+  verifyPromoted
 }) {
   const suffix = `${process.pid}-${Date.now()}`
   const packageBackup = path.join(
@@ -299,10 +309,16 @@ function promoteRelease({
     distRoot,
     `.${path.basename(artifact)}.notarize-backup-${suffix}`
   )
+  const receiptBackup = path.join(
+    distRoot,
+    `.${path.basename(receipt)}.notarize-backup-${suffix}`
+  )
   let packageBackedUp = false
   let artifactBackedUp = false
+  let receiptBackedUp = false
   let packagePromoted = false
   let artifactPromoted = false
+  let receiptPromoted = false
 
   try {
     if (fs.existsSync(packageRoot)) {
@@ -318,8 +334,34 @@ function promoteRelease({
     }
     fs.renameSync(stagedArtifact, artifact)
     artifactPromoted = true
+
+    if (fs.existsSync(receipt)) {
+      fs.renameSync(receipt, receiptBackup)
+      receiptBackedUp = true
+    }
+    fs.renameSync(stagedReceipt, receipt)
+    receiptPromoted = true
+    verifyPromoted()
   } catch (error) {
     const rollbackErrors = []
+    if (receiptPromoted && fs.existsSync(receipt)) {
+      try {
+        fs.renameSync(receipt, stagedReceipt)
+      } catch (rollbackError) {
+        rollbackErrors.push(`receipt: ${rollbackError.message}`)
+      }
+    }
+    if (
+      receiptBackedUp &&
+      fs.existsSync(receiptBackup) &&
+      !fs.existsSync(receipt)
+    ) {
+      try {
+        fs.renameSync(receiptBackup, receipt)
+      } catch (rollbackError) {
+        rollbackErrors.push(`receipt backup: ${rollbackError.message}`)
+      }
+    }
     if (artifactPromoted && fs.existsSync(artifact)) {
       try {
         fs.renameSync(artifact, stagedArtifact)
@@ -364,7 +406,8 @@ function promoteRelease({
 
   for (const backup of [
     packageBackedUp ? packageBackup : null,
-    artifactBackedUp ? artifactBackup : null
+    artifactBackedUp ? artifactBackup : null,
+    receiptBackedUp ? receiptBackup : null
   ]) {
     if (!backup) continue
     try {
@@ -548,13 +591,88 @@ try {
     stagedInstallerApp,
     stagedArtifact
   ])
+  const receipt = path.join(
+    distRoot,
+    `record-${manifest.version}-macos-arm64.release.json`
+  )
+  const stagedReceipt = path.join(temporaryRoot, path.basename(receipt))
+  const artifactSha256 = sha256(stagedArtifact)
+  const artifactBytes = fs.statSync(stagedArtifact).size
+  const payloadManifestSha256 = sha256(stagedManifestPath)
+  const releaseReceipt = {
+    schemaVersion: 1,
+    product: 'record',
+    version: manifest.version,
+    platform: 'darwin',
+    arch: 'arm64',
+    source: manifest.source,
+    teamId: manifest.teamId,
+    artifact: {
+      file: path.basename(artifact),
+      bytes: artifactBytes,
+      sha256: artifactSha256
+    },
+    payloadManifest: {
+      path: path.posix.join(
+        installerAppName,
+        'Contents',
+        'Resources',
+        'payload',
+        'manifest.json'
+      ),
+      sha256: payloadManifestSha256
+    },
+    notarization: {
+      status: 'accepted-and-stapled',
+      recorderService: {
+        submissionId: recorderSubmission.id,
+        status: 'Accepted',
+        logFile: path.basename(recorderSubmission.logPath),
+        logSha256: sha256(recorderSubmission.logPath)
+      },
+      installerApp: {
+        submissionId: installerSubmission.id,
+        status: 'Accepted',
+        logFile: path.basename(installerSubmission.logPath),
+        logSha256: sha256(installerSubmission.logPath)
+      }
+    }
+  }
+  fs.writeFileSync(
+    stagedReceipt,
+    `${JSON.stringify(releaseReceipt, null, 2)}\n`,
+    { flag: 'wx', mode: 0o644 }
+  )
+  const releaseReceiptSha256 = sha256(stagedReceipt)
   promoteRelease({
     stagedPackageRoot,
     stagedArtifact,
-    artifact
+    artifact,
+    stagedReceipt,
+    receipt,
+    verifyPromoted() {
+      const promotedReceipt = readJsonObject(
+        receipt,
+        'Promoted release receipt'
+      )
+      if (
+        sha256(artifact) !== artifactSha256 ||
+        fs.statSync(artifact).size !== artifactBytes ||
+        sha256(receipt) !== releaseReceiptSha256 ||
+        sha256(manifestPath) !== payloadManifestSha256 ||
+        promotedReceipt.source?.commit !== manifest.source.commit ||
+        promotedReceipt.source?.tag !== manifest.source.tag ||
+        promotedReceipt.artifact?.sha256 !== artifactSha256
+      ) {
+        throw new Error('Promoted release bytes do not match their receipt')
+      }
+    }
   })
   console.log(JSON.stringify({
     artifact,
+    artifactSha256,
+    receipt,
+    releaseReceiptSha256,
     installerApp,
     recorderSubmissionId: recorderSubmission.id,
     recorderLogPath: recorderSubmission.logPath,
@@ -563,5 +681,11 @@ try {
     status: 'accepted-and-stapled'
   }, null, 2))
 } finally {
-  fs.rmSync(temporaryRoot, { recursive: true, force: true })
+  try {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true })
+  } catch (error) {
+    console.warn(
+      `Notarization staging cleanup failed for ${temporaryRoot}: ${error.message}`
+    )
+  }
 }

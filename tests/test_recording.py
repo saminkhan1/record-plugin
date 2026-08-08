@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 from fastapi import HTTPException
@@ -21,6 +22,7 @@ from hermes_plugins.record.record.trace_schema import (
     SCHEMA_VERSION,
     http_url_origin,
     normalize_trace_row,
+    redact_url,
     url_origin,
 )
 
@@ -194,11 +196,256 @@ def test_instruction_requirements_support_local_sites_and_arbitrary_observed_app
     }) == {"http://localhost:3000", "https://example.test"}
     assert http_url_origin("chrome-extension://example/page") == ""
     assert url_origin("chrome-extension://example/page") == "chrome-extension://example"
+    malformed_authority = "https://[not-ipv6/path?q=a%20b&access_token=opaque"
+    assert http_url_origin(malformed_authority) == ""
+    assert url_origin(malformed_authority) == ""
     assert evidence.instruction_required_apps({
         "instructions": "Export the quarter in Acme Ledger Pro."
     }, trace=trace) == {
         "Acme Ledger Pro": {"bundle:com.acme.ledger", "name:acme ledger pro"}
     }
+
+
+def test_redact_url_preserves_ordinary_query_and_fragment_for_replay():
+    redacted = redact_url(
+        "https://example.test/report?"
+        "quarter=Q3&page=2&empty=&monkey=banana&zipcode=10001#totals"
+    )
+
+    parsed = urlsplit(redacted)
+    assert parsed.path == "/report"
+    assert parse_qsl(parsed.query, keep_blank_values=True) == [
+        ("quarter", "Q3"),
+        ("page", "2"),
+        ("empty", ""),
+        ("monkey", "banana"),
+        ("zipcode", "10001"),
+    ]
+    assert parsed.fragment == "totals"
+
+
+def test_redact_url_redacts_secret_query_values_without_dropping_replay_data():
+    redacted = redact_url(
+        "https://user:password@example.test/callback?"
+        "view=receipt&access_token=opaque&apiKey=secret&"
+        "refreshToken=refresh&session_id=s123#done"
+    )
+
+    parsed = urlsplit(redacted)
+    assert parsed.netloc == "example.test"
+    assert dict(parse_qsl(parsed.query, keep_blank_values=True)) == {
+        "view": "receipt",
+        "access_token": "[REDACTED]",
+        "apiKey": "[REDACTED]",
+        "refreshToken": "[REDACTED]",
+        "session_id": "[REDACTED]",
+    }
+    assert parsed.fragment == "done"
+
+
+def test_redact_url_redacts_compact_token_keys_and_oauth_fragments():
+    redacted = redact_url(
+        "https://example.test/callback?"
+        "view=receipt&csrfmiddlewaretoken=query-secret&csrftoken=csrf-secret"
+        "#/complete?tab=summary&access_token=fragment-secret&state=keep"
+    )
+
+    parsed = urlsplit(redacted)
+    assert dict(parse_qsl(parsed.query, keep_blank_values=True)) == {
+        "view": "receipt",
+        "csrfmiddlewaretoken": "[REDACTED]",
+        "csrftoken": "[REDACTED]",
+    }
+    route, separator, fragment_query = parsed.fragment.partition("?")
+    assert (route, separator) == ("/complete", "?")
+    assert dict(parse_qsl(fragment_query, keep_blank_values=True)) == {
+        "tab": "summary",
+        "access_token": "[REDACTED]",
+        "state": "keep",
+    }
+
+
+def test_redact_url_preserves_ordinary_fragment_parameters_byte_for_byte():
+    value = "https://example.test/report#totals?quarter=Q3&monkey=banana&zipcode=10001"
+
+    assert redact_url(value) == value
+
+
+def test_url_redaction_matches_shared_cross_language_fixture():
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "url_sanitization_vectors.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert fixture["version"] == 1
+    for vector in fixture["vectors"]:
+        assert redact_url(vector["input"]) == vector["expected"], vector["name"]
+
+
+def test_chrome_trace_persistence_redacts_nested_referrer_arrays_from_legacy_extension(
+    tmp_path,
+):
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "url_sanitization_vectors.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    vector = next(
+        item
+        for item in fixture["vectors"]
+        if item["name"] == "signed_url_signatures_are_redacted"
+    )
+    recording_dir = tmp_path / "recording-1"
+    recording_dir.mkdir()
+    (recording_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": True,
+                "state": "recording",
+                "sessionID": "recording-1",
+                "eventCount": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace_path = recording_dir / "trace.jsonl"
+    trace_path.write_text("", encoding="utf-8")
+
+    accepted = chrome_capture._append_trace_rows(
+        recording_dir,
+        [
+            _row(
+                0,
+                source="chrome",
+                kind="download",
+                payload={
+                    "target": {"selector": "a[download]"},
+                    "effect": {
+                        "download": {
+                            "referrer": [vector["input"]],
+                        }
+                    },
+                },
+            )
+        ],
+    )
+
+    assert accepted == 1
+    persisted = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert persisted["payload"]["effect"]["download"]["referrer"] == [
+        vector["expected"]
+    ]
+    persisted_text = trace_path.read_text(encoding="utf-8")
+    assert "direct-secret" not in persisted_text
+    assert "aws-secret" not in persisted_text
+    assert "aws-session-secret" not in persisted_text
+    assert "google-secret" not in persisted_text
+    assert "azure-secret" not in persisted_text
+
+
+def test_chrome_segment_control_state_redacts_active_url_before_disk(
+    tmp_path,
+    monkeypatch,
+):
+    recording_dir = tmp_path / "recording-1"
+    recording_dir.mkdir()
+    for name, value in (
+        (
+            "metadata.json",
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": True,
+                "state": "recording",
+                "sessionID": "recording-1",
+            },
+        ),
+        (
+            "session.json",
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": True,
+                "state": "recording",
+                "sessionID": "recording-1",
+            },
+        ),
+    ):
+        (recording_dir / name).write_text(json.dumps(value), encoding="utf-8")
+    (recording_dir / "trace.jsonl").write_text("", encoding="utf-8")
+    authorization = "ab" * 32
+    active_state = {
+        "active": True,
+        "recording_dir": str(recording_dir),
+        "capture_authorization_sha256": hashlib.sha256(
+            authorization.encode("ascii")
+        ).hexdigest(),
+    }
+    monkeypatch.setattr(chrome_capture, "_resolve_active_state", lambda: active_state)
+    chrome_capture._write_capture_state(
+        recording_dir,
+        {"sessionActive": True, "desiredProvider": "chrome"},
+        reason="test_chrome_requested",
+    )
+    secret_url = (
+        "https://user:password@example.test/callback?"
+        "quarter=Q3&access_token=query-secret#id_token=fragment-secret"
+    )
+    expected = (
+        "https://example.test/callback?"
+        "quarter=Q3&access_token=%5BREDACTED%5D#id_token=%5BREDACTED%5D"
+    )
+    started = chrome_capture.ChromeNativeHost().handle_message(
+        {
+            "id": 1,
+            "type": "segment.start",
+            "protocolVersion": chrome_capture.CHROME_PROTOCOL_VERSION,
+            "captureAuthorization": authorization,
+            "captureAuthoritySource": chrome_capture.DESKTOP_CAPTURE_AUTHORITY_SOURCE,
+            "contentScriptReady": True,
+            "activeUrl": secret_url,
+            "activeTabId": 7,
+            "activeWindowId": 9,
+            "extensionId": "record-extension",
+        }
+    )
+
+    assert started["ok"] is True
+    assert started["segmentActive"] is True
+    capture_state_path = recording_dir / "capture-state.json"
+    chrome_session_path = recording_dir / "chrome" / "session.json"
+    capture_state = json.loads(capture_state_path.read_text(encoding="utf-8"))
+    chrome_session = json.loads(chrome_session_path.read_text(encoding="utf-8"))
+    assert capture_state["activeUrl"] == expected
+    assert chrome_session["activeUrl"] == expected
+
+    heartbeat_secret = (
+        "https://example.test/next?access_token=heartbeat-query-secret"
+        "#id_token=heartbeat-fragment-secret"
+    )
+    heartbeat = chrome_capture.ChromeNativeHost().handle_message(
+        {
+            "id": 2,
+            "type": "segment.heartbeat",
+            "protocolVersion": chrome_capture.CHROME_PROTOCOL_VERSION,
+            "recordingId": "recording-1",
+            "segmentId": started["segmentId"],
+            "contentScriptReady": True,
+            "activeUrl": heartbeat_secret,
+            "activeTabId": 7,
+            "activeWindowId": 9,
+            "extensionId": "record-extension",
+        }
+    )
+
+    assert heartbeat["ok"] is True
+    persisted_text = capture_state_path.read_text(encoding="utf-8")
+    assert "heartbeat-query-secret" not in persisted_text
+    assert "heartbeat-fragment-secret" not in persisted_text
+    for path in (capture_state_path, chrome_session_path, recording_dir / "trace.jsonl"):
+        text = path.read_text(encoding="utf-8")
+        assert "query-secret" not in text
+        assert "fragment-secret" not in text
 
 
 def test_normalize_accepts_targetless_chrome_document_scroll_with_zero_offsets():

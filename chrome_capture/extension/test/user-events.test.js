@@ -6,11 +6,12 @@ import { fileURLToPath } from "node:url";
 import { JSDOM } from "jsdom";
 
 const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const urlSanitizerSource = readFileSync(path.join(extensionRoot, "src", "url-sanitizer.js"), "utf8");
 const causalitySource = readFileSync(path.join(extensionRoot, "src", "causality.js"), "utf8");
 const userEventsSource = readFileSync(path.join(extensionRoot, "src", "user-events.js"), "utf8");
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-function loadUserEvents() {
+function loadUserEvents(url = "https://private.example.test/account") {
   const runtimeListeners = [];
   const sentMessages = [];
   const ports = [];
@@ -89,7 +90,7 @@ function loadUserEvents() {
     "<!doctype html><html><head><title>Private page</title></head><body></body></html>",
     {
       runScripts: "outside-only",
-      url: "https://private.example.test/account",
+      url,
     },
   );
   const { window } = dom;
@@ -98,6 +99,7 @@ function loadUserEvents() {
   window.chrome = {
     runtime: createRuntime(),
   };
+  window.eval(urlSanitizerSource);
   window.eval(causalitySource);
   window.eval(userEventsSource);
 
@@ -304,6 +306,33 @@ test("active capture records customer inputs and file metadata while redacting p
     }],
   );
   assert.doesNotMatch(JSON.stringify(actions), /never-record-this/);
+
+  harness.close();
+});
+
+test("active capture redacts credential-bearing URLs before extension messaging", async () => {
+  const harness = loadUserEvents(
+    "https://user:password@private.example.test/account?quarter=Q3&access_token=query-secret#/done?refreshToken=fragment-secret&tab=summary",
+  );
+  const { window } = harness;
+  await sleep(0);
+  harness.updateAuthority(true, 1);
+
+  const button = window.document.createElement("button");
+  button.textContent = "Continue";
+  window.document.body.append(button);
+  button.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await sleep(0);
+
+  const action = harness.sentMessages.find((message) => message.type === "hcc-trace-action");
+  assert.ok(action);
+  assert.equal(
+    action.event.payload.browser.url,
+    "https://private.example.test/account?quarter=Q3&access_token=%5BREDACTED%5D#/done?refreshToken=%5BREDACTED%5D&tab=summary",
+  );
+  assert.equal(action.event.payload.browser.frame_url, action.event.payload.browser.url);
+  assert.equal(action.event.payload.browser.top_url, action.event.payload.browser.url);
+  assert.doesNotMatch(JSON.stringify(action), /query-secret|fragment-secret|user:password/);
 
   harness.close();
 });

@@ -1,7 +1,8 @@
 # Record Chrome Provider submission
 
-This is the reviewed release inventory for published extension version `0.2.2`.
-It preserves the Store identity and customer-install validation steps.
+This is the submission inventory for extension update candidate `0.2.3`.
+Version `0.2.2` remains the currently published Store package. This checklist
+does not mark the new candidate approved or published.
 
 ## Account and identity gate
 
@@ -9,11 +10,13 @@ It preserves the Store identity and customer-install validation steps.
       `saminbbkhan` accepted the first draft item.
 - [x] The assigned Item ID and dashboard public key are bound in the manifest and
       `store-identity.json`; the packaging gate derives and verifies the same ID.
-- [x] Run `npm test` and `npm run package:chrome`, then upload
-      `dist/chrome/hermes-chrome-provider-0.2.2.zip` to the existing draft item.
+- [ ] From a clean reviewed commit, run `npm test` and
+      `npm run package:chrome:release`, then upload
+      `dist/chrome/hermes-chrome-provider-0.2.3.zip` to the existing item.
       Do not create a replacement item.
-- [x] Compare `dist/chrome/package-receipt.json` with the reviewed source and
-      commit before building the signed Mac release.
+- [ ] Verify `dist/chrome/package-receipt.json` says `release: true`, records the
+      exact clean source commit, and matches the uploaded ZIP SHA-256 before
+      submitting for review.
 
 The published Chrome Web Store Item ID is
 `anaccpcogeinfllkciaheolngknaabbb`. The retained bootstrap audit identity is
@@ -171,8 +174,13 @@ for the required screenshot.
 
 - [x] Confirm the name is `Record Chrome Provider` and the description opens
       with `Record Chrome Provider works with the Record Mac application`.
-- [x] Google approved the current `0.2.2` Store package. Keep
-      `store-identity.json` at `published`; do not create a replacement item.
+- [x] Google approved the existing `0.2.2` Store package. Keep the same item and
+      public key; do not create a replacement item.
+- [ ] Google approves and publishes `0.2.3` to the intended distribution. Only
+      then copy the exact release receipt's version, archive SHA-256, and source
+      commit into `store-identity.json` as `publishedVersion`,
+      `publishedArchiveSha256`, and `publishedSourceCommit`. Until that commit,
+      Mac release packaging and customer Store installation must remain blocked.
 
   Customer verification instructions:
 
@@ -187,7 +195,7 @@ for the required screenshot.
 - [ ] On a clean physical Mac, sign Chrome into an allowlisted tester account,
       launch the signed/notarized Record app once, install/enable the store
       extension, and confirm `chrome://extensions` shows the exact assigned ID in
-      `store-identity.json` and version `0.2.2`.
+      `store-identity.json` and version `0.2.3`.
 - [ ] If local-file workflows are part of the release, enable **Allow access to
       file URLs** in the extension details and verify one non-sensitive
       `file://` recording. Do not claim local-file capture without that setting.

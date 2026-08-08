@@ -1,4 +1,4 @@
-importScripts("causality.js");
+importScripts("url-sanitizer.js", "causality.js");
 
 const actionCausality = globalThis.HermesCausality.createActionCausality();
 const HOST_NAME = "com.hermes.chrome_capture";
@@ -240,13 +240,13 @@ function connectNative() {
 
 function nativeRequest(type, payload = {}, timeoutMs = 5000) {
   const id = nextNativeId++;
-  const message = {
+  const message = globalThis.HermesURLSanitizer.sanitizeValue({
     id,
     type,
     extensionId: chrome.runtime.id,
     extensionVersion: EXTENSION_VERSION,
     ...payload,
-  };
+  });
   return new Promise((resolve, reject) => {
     try {
       const port = connectNative();
@@ -347,7 +347,7 @@ function segmentPayload(tab, reason = "heartbeat") {
 
 function writeCheckpoint() {
   const authorizationEpoch = state.captureAuthorizationEpoch;
-  const checkpoint = {
+  const checkpoint = globalThis.HermesURLSanitizer.sanitizeValue({
     schemaVersion: 4,
     recordingId: state.recordingId,
     segmentId: state.segmentId,
@@ -356,7 +356,7 @@ function writeCheckpoint() {
     providerSequence: state.providerSequence,
     authorizedRecordingId: state.authorizedRecordingId,
     captureAuthorization: state.captureAuthorization,
-  };
+  });
   checkpointWriteChain = checkpointWriteChain.catch(() => {}).then(async () => {
     if (!captureConsentCurrent(authorizationEpoch)) return;
     try {
@@ -371,8 +371,11 @@ function writeCheckpoint() {
 async function restoreCheckpoint() {
   try {
     const value = await chrome.storage.local.get([CHECKPOINT_KEY, ACTION_OUTBOX_KEY]);
-    const checkpoint = value?.[CHECKPOINT_KEY]?.schemaVersion === 4
+    const storedCheckpoint = value?.[CHECKPOINT_KEY]?.schemaVersion === 4
       ? value[CHECKPOINT_KEY]
+      : null;
+    const checkpoint = storedCheckpoint
+      ? globalThis.HermesURLSanitizer.sanitizeValue(storedCheckpoint)
       : null;
     if (checkpoint?.activeTarget) state.activeTarget = checkpoint.activeTarget;
     if (checkpoint?.recordingId) state.recordingId = checkpoint.recordingId;
@@ -392,7 +395,10 @@ async function restoreCheckpoint() {
     if (/^[0-9a-f]{64}$/.test(String(checkpoint?.captureAuthorization || ""))) {
       state.captureAuthorization = checkpoint.captureAuthorization;
     }
-    const storedOutbox = value?.[ACTION_OUTBOX_KEY];
+    const originalOutbox = value?.[ACTION_OUTBOX_KEY];
+    const storedOutbox = originalOutbox
+      ? globalThis.HermesURLSanitizer.sanitizeValue(originalOutbox)
+      : null;
     const queued = storedOutbox?.recordingId === state.recordingId && Array.isArray(storedOutbox.rows)
       ? storedOutbox.rows
       : [];
@@ -400,6 +406,14 @@ async function restoreCheckpoint() {
       state.providerSequence,
       ...queued.map((row) => Number(row?.payload?.meta?.provider_sequence) || 0),
     );
+    const migrated = {};
+    if (checkpoint && JSON.stringify(checkpoint) !== JSON.stringify(storedCheckpoint)) {
+      migrated[CHECKPOINT_KEY] = checkpoint;
+    }
+    if (storedOutbox && JSON.stringify(storedOutbox) !== JSON.stringify(originalOutbox)) {
+      migrated[ACTION_OUTBOX_KEY] = storedOutbox;
+    }
+    if (Object.keys(migrated).length) await chrome.storage.local.set(migrated);
   } catch {
     // Storage is best-effort.
   }
@@ -617,7 +631,7 @@ function scheduleHeartbeat() {
 
 async function injectUserEvents(tabId) {
   try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["src/causality.js", "src/user-events.js"] });
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["src/url-sanitizer.js", "src/causality.js", "src/user-events.js"] });
   } catch {
     // Content scripts are also declared in the manifest; injection is best-effort for already-open pages.
   }
@@ -639,6 +653,7 @@ async function sendTraceActions(rows) {
     ensureActionCorrelation(row);
     ensureProviderIdentity(row);
   });
+  const sanitizedRows = globalThis.HermesURLSanitizer.sanitizeValue(rows);
   // The durable outbox is the recovery authority. A failed native send must
   // leave its rows queued, but it must not poison every later flush in this
   // worker lifetime.
@@ -646,10 +661,10 @@ async function sendTraceActions(rows) {
     const stored = await chrome.storage.local.get(ACTION_OUTBOX_KEY);
     const storedOutbox = stored?.[ACTION_OUTBOX_KEY];
     const pending = storedOutbox?.recordingId === recordingId && Array.isArray(storedOutbox.rows)
-      ? storedOutbox.rows
+      ? globalThis.HermesURLSanitizer.sanitizeValue(storedOutbox.rows)
       : [];
     const byId = new Map();
-    [...pending, ...rows].forEach((row) => {
+    [...pending, ...sanitizedRows].forEach((row) => {
       const id = row?.payload?.meta?.provider_event_id;
       if (id) byId.set(id, row);
     });
@@ -753,12 +768,12 @@ async function finalizeContinuity(expectedRecordingId = "") {
 function rowFromContentEvent(event, sender) {
   const tab = sender.tab || state.activeTarget || {};
   const browser = browserPayload(tab, event.payload?.browser || event.browser || {});
-  return {
+  return globalThis.HermesURLSanitizer.sanitizeValue({
     ts: event.ts || nowIso(),
     kind: event.kind || "click",
     payload: { ...(event.payload || {}), browser: { ...browser, ...(event.payload?.browser || {}) } },
     quality: event.quality || { confidence: "high", warnings: [] },
-  };
+  });
 }
 
 async function captureScreenshot(label = "manual", afterActionId = "") {

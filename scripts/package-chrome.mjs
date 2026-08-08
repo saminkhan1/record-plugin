@@ -5,32 +5,27 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { deflateRawSync } from 'node:zlib'
+import {
+  requireChromeReleaseSource,
+  validateChromeExtensionIdentity
+} from './release-contract.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const extensionRoot = path.join(repoRoot, 'chrome_capture', 'extension')
 const outputRoot = path.join(repoRoot, 'dist', 'chrome')
-const packageFiles = [
+export const chromePackageFiles = [
   'manifest.json',
   'icons/icon128.png',
   'src/background.js',
   'src/causality.js',
   'src/popup.html',
   'src/popup.js',
+  'src/url-sanitizer.js',
   'src/user-events.js'
 ]
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex')
-}
-
-function extensionIdFromKey(publicKey) {
-  const digest = createHash('sha256')
-    .update(Buffer.from(publicKey, 'base64'))
-    .digest()
-    .subarray(0, 16)
-  return [...digest.toString('hex')]
-    .map(character => String.fromCharCode('a'.charCodeAt(0) + Number.parseInt(character, 16)))
-    .join('')
 }
 
 function crc32(buffer) {
@@ -126,70 +121,81 @@ function deterministicZip(files) {
   ])
 }
 
-const manifest = JSON.parse(
-  fs.readFileSync(path.join(extensionRoot, 'manifest.json'), 'utf8')
-)
-const identity = JSON.parse(
-  fs.readFileSync(path.join(extensionRoot, 'store-identity.json'), 'utf8')
-)
-const extensionPackage = JSON.parse(
-  fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')
-)
-const extensionId = extensionIdFromKey(String(manifest.key || ''))
-const version = String(manifest.version || '').trim()
-if (
-  manifest.manifest_version !== 3 ||
-  identity.schemaVersion !== 1 ||
-  !['assigned', 'published'].includes(identity.status) ||
-  identity.extensionId !== extensionId ||
-  extensionPackage.version !== version ||
-  !/^\d+(?:\.\d+){0,3}$/.test(version)
-) {
-  throw new Error('Chrome Web Store manifest, package version, and assigned identity do not match')
+export function buildChromeArchive(root = extensionRoot) {
+  const files = chromePackageFiles.map(name => {
+    const target = path.join(root, name)
+    const stat = fs.lstatSync(target, { throwIfNoEntry: false })
+    if (!stat?.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`Required extension file is missing or unsafe: ${name}`)
+    }
+    const contents = fs.readFileSync(target)
+    if (/\.(?:html|js)$/u.test(name)) {
+      const source = contents.toString('utf8')
+      if (
+        /\beval\s*\(/u.test(source) ||
+        /\bnew\s+Function\s*\(/u.test(source) ||
+        /<(?:script|link)\b[^>]+(?:src|href)=["']https?:/iu.test(source)
+      ) {
+        throw new Error(`Remote or dynamically evaluated code is not allowed in ${name}`)
+      }
+    }
+    return { name, contents }
+  })
+  return { files, archive: deterministicZip(files) }
 }
 
-const files = packageFiles.map(name => {
-  const target = path.join(extensionRoot, name)
-  const stat = fs.lstatSync(target, { throwIfNoEntry: false })
-  if (!stat?.isFile() || stat.isSymbolicLink()) {
-    throw new Error(`Required extension file is missing or unsafe: ${name}`)
-  }
-  const contents = fs.readFileSync(target)
-  if (/\.(?:html|js)$/u.test(name)) {
-    const source = contents.toString('utf8')
-    if (
-      /\beval\s*\(/u.test(source) ||
-      /\bnew\s+Function\s*\(/u.test(source) ||
-      /<(?:script|link)\b[^>]+(?:src|href)=["']https?:/iu.test(source)
-    ) {
-      throw new Error(`Remote or dynamically evaluated code is not allowed in ${name}`)
+export function packageChrome({ releaseSource = false } = {}) {
+  const chrome = validateChromeExtensionIdentity(repoRoot)
+  const source = releaseSource
+    ? requireChromeReleaseSource(repoRoot, chrome.version)
+    : null
+  const { files, archive } = buildChromeArchive(extensionRoot)
+  const archiveName = `hermes-chrome-provider-${chrome.version}.zip`
+  const archivePath = path.join(outputRoot, archiveName)
+  fs.mkdirSync(outputRoot, { recursive: true })
+  fs.writeFileSync(archivePath, archive, { mode: 0o644 })
+
+  if (source) {
+    const finalSource = requireChromeReleaseSource(repoRoot, chrome.version)
+    if (finalSource.commit !== source.commit) {
+      throw new Error('Chrome release source changed while packaging')
     }
   }
-  return { name, contents }
-})
-
-const archive = deterministicZip(files)
-const archiveName = `hermes-chrome-provider-${version}.zip`
-const archivePath = path.join(outputRoot, archiveName)
-fs.mkdirSync(outputRoot, { recursive: true })
-fs.writeFileSync(archivePath, archive, { mode: 0o644 })
-
-const receipt = {
-  schemaVersion: 1,
-  product: 'hermes-chrome-provider',
-  version,
-  extensionId,
-  archive: {
-    path: archiveName,
-    bytes: archive.length,
-    sha256: sha256(archive)
-  },
-  files: files.map(file => ({
-    path: file.name,
-    bytes: file.contents.length,
-    sha256: sha256(file.contents)
-  }))
+  const receipt = {
+    schemaVersion: 2,
+    product: 'hermes-chrome-provider',
+    release: Boolean(source),
+    source,
+    version: chrome.version,
+    extensionId: chrome.extensionId,
+    store: {
+      status: chrome.status,
+      publishedVersion: chrome.publishedVersion,
+      currentVersionPublished: chrome.currentVersionPublished
+    },
+    archive: {
+      path: archiveName,
+      bytes: archive.length,
+      sha256: sha256(archive)
+    },
+    files: files.map(file => ({
+      path: file.name,
+      bytes: file.contents.length,
+      sha256: sha256(file.contents)
+    }))
+  }
+  const receiptPath = path.join(outputRoot, 'package-receipt.json')
+  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o644 })
+  const result = { archivePath, receiptPath, ...receipt }
+  console.log(JSON.stringify(result, null, 2))
+  return result
 }
-const receiptPath = path.join(outputRoot, 'package-receipt.json')
-fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o644 })
-console.log(JSON.stringify({ archivePath, receiptPath, ...receipt }, null, 2))
+
+const isMain = process.argv[1] &&
+  fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
+if (isMain) {
+  const args = process.argv.slice(2)
+  const unknown = args.filter(value => value !== '--release-source')
+  if (unknown.length) throw new Error(`Unknown argument(s): ${unknown.join(' ')}`)
+  packageChrome({ releaseSource: args.includes('--release-source') })
+}

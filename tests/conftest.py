@@ -18,8 +18,15 @@ def _load_plugin_package() -> None:
         namespace.__path__ = []
         namespace.__package__ = "hermes_plugins"
         sys.modules["hermes_plugins"] = namespace
-    if PLUGIN_PACKAGE in sys.modules:
+    loaded = sys.modules.get(PLUGIN_PACKAGE)
+    loaded_file = getattr(loaded, "__file__", None)
+    if loaded_file and Path(loaded_file).resolve() == (
+        PLUGIN_ROOT / "__init__.py"
+    ).resolve():
         return
+    for name in tuple(sys.modules):
+        if name == PLUGIN_PACKAGE or name.startswith(f"{PLUGIN_PACKAGE}."):
+            sys.modules.pop(name, None)
 
     spec = importlib.util.spec_from_file_location(
         PLUGIN_PACKAGE,
@@ -36,3 +43,10 @@ def _load_plugin_package() -> None:
 
 
 _load_plugin_package()
+
+
+def pytest_collectstart(collector) -> None:
+    """Undo host imports that discover an installed Record during collection."""
+
+    if collector.__class__.__name__ == "Module":
+        _load_plugin_package()

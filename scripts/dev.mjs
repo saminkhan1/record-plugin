@@ -7,6 +7,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { clean, cleanCaches } from './clean.mjs'
+import {
+  validateChromeExtensionIdentity,
+  validateProductVersions
+} from './release-contract.mjs'
 import { runtimeFiles, validateRuntimeFiles } from './runtime-files.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -21,6 +25,8 @@ const hermesBin = path.resolve(
 const hermesPython = path.resolve(
   process.env.HERMES_PYTHON || path.join(hostRoot, '.venv', 'bin', 'python')
 )
+const productVersions = validateProductVersions(repoRoot)
+const chromeIdentity = validateChromeExtensionIdentity(repoRoot)
 const buildOnly = process.argv.slice(2).includes('--build-only')
 const unknownArguments = process.argv
   .slice(2)
@@ -234,16 +240,10 @@ function main() {
   const extensionManifest = JSON.parse(
     fs.readFileSync(path.join(pluginTarget, 'chrome_capture', 'extension', 'manifest.json'), 'utf8')
   )
-  const storeIdentity = JSON.parse(
-    fs.readFileSync(
-      path.join(pluginTarget, 'chrome_capture', 'extension', 'store-identity.json'),
-      'utf8'
-    )
-  )
   writeJsonAtomic(path.join(hermesHome, 'record', 'installation.json'), {
     schemaVersion: 2,
     installedAt: new Date().toISOString(),
-    version: String(JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'))).version),
+    version: productVersions.version,
     platform: 'darwin',
     arch: 'arm64',
     release: false,
@@ -260,9 +260,14 @@ function main() {
     notarizationStatus: 'not-applicable-dev',
     notarizationSubmissionId: null,
     chromeMode: 'local',
-    chromeExtensionId: storeIdentity.extensionId,
+    chromeExtensionId: chromeIdentity.extensionId,
     chromeExtensionVersion: String(extensionManifest.version),
-    chromeStoreStatus: storeIdentity.status,
+    chromeStoreStatus: chromeIdentity.currentVersionPublished
+      ? 'published'
+      : 'update-required',
+    chromePublishedVersion: chromeIdentity.publishedVersion,
+    chromePublishedSourceCommit: chromeIdentity.publishedSourceCommit,
+    chromeExtensionArchiveSha256: chromeIdentity.publishedArchiveSha256,
     pluginEnableAction: 'enabled'
   })
   run(hermesPython, [

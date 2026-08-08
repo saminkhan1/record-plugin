@@ -402,6 +402,20 @@ def load_recording_build(
             status_code=409,
             detail="The reviewed Hermes job build is invalid.",
         ) from exc
+    sealed_provenance = (
+        envelope.get("provenance")
+        if isinstance(envelope.get("provenance"), dict)
+        else {}
+    )
+    canonical_workflow = dict(workflow)
+    canonical_workflow.pop("build", None)
+    if sealed_provenance.get("build_digest") != workflow_digest(
+        canonical_workflow
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed workflow changed. Draft and review it again.",
+        )
     expected_payload = {"action": "create", **job_spec}
     if payload != expected_payload or envelope.get("payload") != expected_payload:
         raise HTTPException(
@@ -629,10 +643,23 @@ def _publish_reviewed_record_build(
             provenance=provenance,
             webhook_trigger=webhook_trigger,
         )
+    except modules["hermes"].NativeReconciliationRequired:
+        log.warning(
+            "Record kept promoted artifacts because native workflow state "
+            "requires reconciliation"
+        )
+        raise
     except Exception:
         promotion.rollback()
         raise
-    promotion.commit()
+    cleanup_failures = promotion.commit()
+    if cleanup_failures:
+        log.warning(
+            "Record installed the workflow but could not remove %d artifact "
+            "backup(s): %s",
+            len(cleanup_failures),
+            "; ".join(cleanup_failures),
+        )
     return {
         "profile": profile_name,
         "build_dir": str(build_dir),
@@ -641,7 +668,6 @@ def _publish_reviewed_record_build(
         "install": install,
         "webhook": install.get("webhook"),
     }
-
 
 def publish_record_build(
     modules: Dict[str, Any],
@@ -653,6 +679,15 @@ def publish_record_build(
     expected_review_envelope_sha256: str,
     webhook_trigger: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if webhook_trigger is not None and profile_name != "default":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Webhook workflows can currently be turned on only in the "
+                "Default profile. Reopen Workflows in Default and review the "
+                "workflow there."
+            ),
+        )
     if not (build_dir / "cronjob-payload.json").is_file():
         raise HTTPException(status_code=404, detail="Compiled Record payload not found")
     guard_path = build_dir / "publication-guard.json"

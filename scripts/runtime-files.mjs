@@ -32,6 +32,7 @@ export const runtimeFiles = [
   'chrome_capture/extension/src/causality.js',
   'chrome_capture/extension/src/popup.html',
   'chrome_capture/extension/src/popup.js',
+  'chrome_capture/extension/src/url-sanitizer.js',
   'chrome_capture/extension/src/user-events.js'
 ]
 

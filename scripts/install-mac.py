@@ -43,12 +43,38 @@ LAUNCH_SERVICES_REGISTER = Path(
 )
 REQUIRED_CAPABILITIES = {
     "plugin_llm",
+    "plugin_agent",
     "plugin_profile",
     "plugin_tool_dispatch",
     "builtin_tool_discovery",
     "plugin_hooks",
+    "atomic_webhook_mutation",
 }
 ARM64_CPU_TYPE = 0x0100000C
+MANAGED_RUNTIME_PROBE = """
+import inspect
+
+from agent.plugin_agent import PluginAgent
+from hermes_cli.plugins import PluginContext
+from hermes_cli.webhook import mutate_subscriptions
+
+assert isinstance(getattr(PluginContext, "agent", None), property)
+assert callable(getattr(PluginAgent, "run", None))
+assert callable(mutate_subscriptions)
+inspect.signature(PluginAgent.run).bind(
+    object(),
+    user_message="host compatibility probe",
+    system_prompt="host compatibility probe",
+    task_id="record:host-compatibility",
+    max_iterations=1,
+    tool_progress_callback=None,
+    status_callback=None,
+    required_tools=["record_submit_draft"],
+    allowed_tools=["record_submit_draft"],
+    full_capabilities=False,
+    purpose="workflow.draft",
+)
+"""
 
 
 class InstallError(RuntimeError):
@@ -198,6 +224,11 @@ def _recorder_build_manifest(root: Path) -> dict[str, Any] | None:
         if isinstance(manifest.get("identifiers"), dict)
         else {}
     )
+    source = (
+        manifest.get("source")
+        if isinstance(manifest.get("source"), dict)
+        else {}
+    )
     if (
         schema_version != 2
         or manifest.get("product") != "record"
@@ -209,6 +240,15 @@ def _recorder_build_manifest(root: Path) -> dict[str, Any] | None:
         or identifiers.get("service") != RECORDER_SERVICE_IDENTIFIER
         or client.get("path") != RECORDER_CLIENT_PATH.as_posix()
         or service.get("path") != RECORDER_SERVICE_PATH.as_posix()
+        or (
+            manifest.get("release") is True
+            and (
+                not re.fullmatch(
+                    r"[0-9a-f]{40}", str(source.get("commit") or "")
+                )
+                or source.get("tag") != f"v{manifest.get('version')}"
+            )
+        )
     ):
         return None
     for entry in (client, service):
@@ -295,6 +335,7 @@ def _write_recorder_install_receipt(
         "installedAt": _utc_now(),
         "teamId": build_manifest["teamId"],
         "signingIdentity": build_manifest.get("signingIdentity"),
+        "source": build_manifest.get("source"),
         "identifiers": identifiers,
         "recorderManifestSha256": _sha256(
             target / "recorder-manifest.json"
@@ -422,6 +463,11 @@ def _verify_package(package_root: Path) -> dict[str, Any]:
         else set()
     )
     files = manifest.get("files") if manifest else None
+    source = (
+        manifest.get("source")
+        if manifest and isinstance(manifest.get("source"), dict)
+        else {}
+    )
     if (
         not manifest
         or manifest.get("schemaVersion") != 3
@@ -429,6 +475,13 @@ def _verify_package(package_root: Path) -> dict[str, Any]:
         or manifest.get("platform") != "darwin"
         or manifest.get("arch") != "arm64"
         or manifest.get("release") is not True
+        or not re.fullmatch(
+            r"\d+\.\d+\.\d+", str(manifest.get("version") or "")
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}", str(source.get("commit") or "")
+        )
+        or source.get("tag") != f"v{manifest.get('version')}"
         or not isinstance(manifest.get("teamId"), str)
         or not manifest.get("teamId")
         or not REQUIRED_CAPABILITIES.issubset(capabilities)
@@ -439,6 +492,17 @@ def _verify_package(package_root: Path) -> dict[str, Any]:
         or not manifest.get("chromeExtensionId")
         or not isinstance(manifest.get("chromeExtensionVersion"), str)
         or not manifest.get("chromeExtensionVersion")
+        or manifest.get("chromeStoreStatus") != "published"
+        or manifest.get("chromePublishedVersion")
+        != manifest.get("chromeExtensionVersion")
+        or not re.fullmatch(
+            r"[0-9a-f]{40}",
+            str(manifest.get("chromePublishedSourceCommit") or ""),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(manifest.get("chromeExtensionArchiveSha256") or ""),
+        )
         or not isinstance(files, dict)
     ):
         raise InstallError(
@@ -713,8 +777,7 @@ def _resolve_managed_python(explicit: str | None, hermes_root: Path) -> Path:
             [
                 str(candidate),
                 "-c",
-                "import hermes_constants; import hermes_cli.main; "
-                "import hermes_cli.plugins",
+                MANAGED_RUNTIME_PROBE,
             ],
             env=probe_env,
             check=False,
@@ -725,12 +788,14 @@ def _resolve_managed_python(explicit: str | None, hermes_root: Path) -> Path:
             return candidate
     if explicit:
         raise InstallError(
-            f"The requested Python is not a usable Hermes runtime: {explicit}"
+            "The requested Python does not provide the Wexpro Agent features "
+            f"required by Record: {explicit}. Update Wexpro Agent and run "
+            "Record Installer again."
         )
     raise InstallError(
-        "Hermes Desktop's managed runtime is not ready at "
-        f"{candidates[0]}. Open Hermes Desktop and finish setup, then run "
-        "Record Installer again."
+        "Wexpro Agent's managed runtime is missing or too old at "
+        f"{candidates[0]}. Update Wexpro Agent, open it to finish setup, "
+        "then run Record Installer again."
     )
 
 
@@ -898,7 +963,7 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
     ):
         raise InstallError(
             "Chrome Web Store installation is not release-approved; publish "
-            "the assigned extension before customer install"
+            "the exact packaged extension version before customer install"
         )
     _require_customer_distribution(
         package_root,
@@ -1126,6 +1191,7 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
             "arch": manifest["arch"],
             "release": manifest["release"],
             "teamId": manifest["teamId"],
+            "source": manifest["source"],
             "profile": profile_name,
             "hermesHome": str(hermes_home),
             "pythonPlugin": str(python_target),
@@ -1144,6 +1210,13 @@ def _install_transaction(argv: list[str]) -> dict[str, Any]:
             "chromeExtensionId": manifest["chromeExtensionId"],
             "chromeExtensionVersion": manifest["chromeExtensionVersion"],
             "chromeStoreStatus": manifest["chromeStoreStatus"],
+            "chromePublishedVersion": manifest["chromePublishedVersion"],
+            "chromePublishedSourceCommit": manifest[
+                "chromePublishedSourceCommit"
+            ],
+            "chromeExtensionArchiveSha256": manifest[
+                "chromeExtensionArchiveSha256"
+            ],
             "pluginEnableAction": (
                 "skipped" if arguments.no_enable else "enabled"
             ),
