@@ -56,7 +56,7 @@ def complete_structured(
     """
 
     context = _plugin_context()
-    profile = str(context.profile_name or "default")
+    profile = str(getattr(context, "profile_name", "") or "default")
     from hermes_constants import get_hermes_home
 
     profile_home = str(get_hermes_home().expanduser().resolve())
@@ -165,6 +165,8 @@ def run_agent(
     user_message: Any,
     system_prompt: str,
     task_id: str,
+    trace_scope: str = "",
+    recording_id: str = "",
     max_iterations: int = 24,
     tool_progress_callback: Any = None,
     status_callback: Any = None,
@@ -181,6 +183,10 @@ def run_agent(
     """
 
     context = _plugin_context()
+    profile = str(getattr(context, "profile_name", "") or "default")
+    scope = str(trace_scope or "workflow").strip() or "workflow"
+    recording = str(recording_id or "").strip()
+    correlation = f"{scope}:{recording}" if recording else scope
     result = context.agent.run(
         user_message=user_message,
         system_prompt=system_prompt,
@@ -192,6 +198,18 @@ def run_agent(
         allowed_tools=allowed_tools,
         full_capabilities=full_capabilities,
         purpose=purpose,
+        observability_context={
+            "name": f"record.{purpose}",
+            "session_id": f"record:profile={profile}:workflow={scope}",
+            "tags": ["record", f"phase:{purpose}"],
+            "metadata": {
+                "profile_id": profile,
+                "workflow_id": scope,
+                "recording_id": recording,
+                "correlation_id": correlation,
+                "phase": purpose,
+            },
+        },
     )
     if not isinstance(result, dict):
         raise RuntimeError("Hermes planning agent returned an invalid result")

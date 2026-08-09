@@ -127,7 +127,7 @@ struct HermesRecorderCLI {
                 case "initialize":
                     printJSON(rpcResponse(id: id, result: [
                         "protocolVersion": "2024-11-05",
-                        "serverInfo": ["name": "hermes-recorder", "version": "0.1.2"],
+                        "serverInfo": ["name": "hermes-recorder", "version": "0.1.3"],
                         "capabilities": ["tools": [:]],
                     ]))
                 case "tools/list":

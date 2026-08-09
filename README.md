@@ -184,6 +184,11 @@ export HERMES_RECORDER_SIGNING_IDENTITY='Developer ID Application: Example (TEAM
 npm run package:mac
 ```
 
+The published Chrome Provider 0.2.3 archive was produced with Node 26.5.0
+(bundled zlib 1.2.12). Use that runtime for Record release packaging; the
+release preflight rejects any runtime whose compressed ZIP bytes do not match
+the approved Store archive SHA-256 instead of changing the recorded hash.
+
 If exactly one Developer ID Application identity is available, the build can
 select it automatically. Otherwise it asks for the explicit identity. The
 package command always requires release mode and the expected Apple Team ID;

@@ -1361,6 +1361,54 @@ def test_v3_evidence_pack_correlates_native_source_rows_and_seals(tmp_path):
     assert "capture_manifest_file_mismatch:trace.jsonl" in acceptance["blockers"][0]["details"]
 
 
+def test_legacy_capture_seal_can_upgrade_before_lifecycle_projection(tmp_path):
+    recording_dir = _write_recording(
+        tmp_path,
+        instructions="Inspect the saved workflow.",
+        rows=[],
+    )
+    for name in ("metadata.json", "session.json"):
+        value = json.loads((recording_dir / name).read_text(encoding="utf-8"))
+        value.update(
+            {
+                "state": "scheduled",
+                "status": "scheduled",
+                "scheduled_job_id": "job-123",
+            }
+        )
+        write_json(recording_dir / name, value)
+
+    pack = evidence.build_evidence_pack(recording_dir)
+    current = evidence.seal_capture(recording_dir, evidence_pack=pack)
+    legacy = {
+        **current,
+        "schemaVersion": evidence.LEGACY_CAPTURE_MANIFEST_SCHEMA,
+        "files": [
+            {
+                "path": path.relative_to(recording_dir).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in evidence._legacy_sealed_files(recording_dir)
+        ],
+    }
+    write_json(recording_dir / "capture-manifest.json", legacy)
+    assert evidence.verified_capture_acceptance(recording_dir)["blockers"] == []
+
+    upgraded = recording.seal_draft_revision(recording_dir)
+    assert upgraded["schemaVersion"] == evidence.CAPTURE_MANIFEST_SCHEMA
+    assert all(
+        item["path"] not in {"metadata.json", "session.json"}
+        for item in upgraded["files"]
+    )
+
+    for name in ("metadata.json", "session.json"):
+        value = json.loads((recording_dir / name).read_text(encoding="utf-8"))
+        value.update({"state": "needs_redraft", "status": "needs_redraft"})
+        write_json(recording_dir / name, value)
+    assert evidence.verified_capture_acceptance(recording_dir)["blockers"] == []
+
+
 def test_capture_completeness_requires_media_referenced_by_frame_index(tmp_path):
     recording_dir = _write_recording(tmp_path, instructions="Inspect evidence.", rows=[])
     (recording_dir / "raw").mkdir()

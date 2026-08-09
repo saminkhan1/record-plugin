@@ -1,3 +1,3 @@
 name: record
-version: "0.1.2"
+version: "0.1.3"
 description: Record a desktop workflow, review it, and install a scheduled or webhook-triggered Hermes job.

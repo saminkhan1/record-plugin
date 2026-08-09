@@ -742,6 +742,52 @@ def _mark_recording_scheduled(
         write_json(path, value)
 
 
+def _reconcile_recording_schedule(
+    recording_dir: Path,
+    hermes_module: Any,
+    recording_module: Any,
+) -> str:
+    """Project a confirmed native Cron removal into both lifecycle files."""
+
+    values = [
+        (path, read_json(path))
+        for path in (recording_dir / "metadata.json", recording_dir / "session.json")
+    ]
+    scheduled = [
+        value
+        for _path, value in values
+        if str(value.get("state") or value.get("status") or "") == "scheduled"
+    ]
+    if not scheduled:
+        return "not_scheduled"
+    if len(scheduled) != len(values):
+        return "unknown"
+    job_ids = {
+        str(value.get("scheduled_job_id") or "").strip()
+        for value in scheduled
+        if str(value.get("scheduled_job_id") or "").strip()
+    }
+    # Webhook workflows have no Cron job ID and are reconciled by their native
+    # route transaction. Divergent lifecycle projections fail closed here.
+    if len(job_ids) != 1:
+        return "unknown"
+    job_id = next(iter(job_ids))
+    presence = hermes_module.cron_job_presence(job_id)
+    if presence != "missing":
+        return presence
+    # A valid legacy v1 capture seal includes mutable lifecycle files. Upgrade
+    # it before changing those files; an invalid seal remains failed closed.
+    recording_module.seal_draft_revision(recording_dir)
+    detected_at = utc_now()
+    for path, value in values:
+        value["state"] = "needs_redraft"
+        value["status"] = "needs_redraft"
+        value["schedule_missing_at"] = detected_at
+        value["scheduled_job_id"] = job_id
+        write_json(path, value)
+    return "missing"
+
+
 @router.get("/recordings/active")
 def active_recording(profile: str = ""):
     profile_name, home = _cron_profile_home(profile)
@@ -934,6 +980,7 @@ def stop_recording_from_desktop(
 
 @router.post("/recordings/{recording_key:path}/discard")
 def discard_recording(recording_key: str, body: RecordRecordingDiscardRequest):
+    modules = load_record_modules()
     _profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key, require_bundle=False)
     # Do not delete or mutate a bundle while its drafter is reading/staging it.
@@ -947,6 +994,11 @@ def discard_recording(recording_key: str, body: RecordRecordingDiscardRequest):
     with _recording_operation_lock(recording_dir):
         if _draft_operation_active(recording_dir):
             raise HTTPException(status_code=409, detail="Drafting is still finishing cancellation.")
+        _reconcile_recording_schedule(
+            recording_dir,
+            modules["hermes"],
+            modules["recording"],
+        )
         try:
             state = load_recording_status(home=home, recording_dir=recording_dir)["status"]
         except HTTPException:
@@ -971,6 +1023,11 @@ def get_review_conversation(
     profile_name, home = _cron_profile_home(profile)
     recording_dir = resolve_recording_ref(home, recording_key)
     with _recording_operation_lock(recording_dir):
+        _reconcile_recording_schedule(
+            recording_dir,
+            modules["hermes"],
+            modules["recording"],
+        )
         workflow_path = recording_dir / "workflow.json"
         if not workflow_path.is_file():
             raise HTTPException(status_code=404, detail="Draft workflow not found")
@@ -992,6 +1049,11 @@ def post_review_conversation(recording_key: str, body: RecordReviewConversationR
     profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key)
     with _recording_operation_lock(recording_dir):
+        _reconcile_recording_schedule(
+            recording_dir,
+            modules["hermes"],
+            modules["recording"],
+        )
         if _draft_operation_active(recording_dir):
             raise HTTPException(status_code=409, detail="A draft operation is already in progress.")
         workflow_path = recording_dir / "workflow.json"
@@ -1102,6 +1164,12 @@ def draft_recording_only(recording_key: str, body: RecordRecordingDraftOnlyReque
     modules = load_record_modules()
     profile_name, home = _cron_profile_home(body.profile)
     recording_dir = resolve_recording_ref(home, recording_key)
+    with _recording_operation_lock(recording_dir):
+        _reconcile_recording_schedule(
+            recording_dir,
+            modules["hermes"],
+            modules["recording"],
+        )
     current = load_recording_status(home=home, recording_dir=recording_dir)
     if current.get("status") == "recording":
         raise HTTPException(status_code=409, detail="Stop the recording before drafting.")
@@ -1355,6 +1423,11 @@ def _schedule_recording_locked(
     home: Path,
     recording_dir: Path,
 ):
+    _reconcile_recording_schedule(
+        recording_dir,
+        modules["hermes"],
+        modules["recording"],
+    )
     if _draft_operation_active(recording_dir):
         raise HTTPException(status_code=409, detail="A draft operation is already in progress.")
     run_mode, schedule = _start_mode(body.run_mode, body.schedule)

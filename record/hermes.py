@@ -33,6 +33,27 @@ _CRON_TOOL_FIELDS = tuple(CronJobCreate.model_fields)
 _WEBHOOK_ROUTE_UNSET = object()
 
 
+def cron_job_presence(job_id: str) -> str:
+    """Return whether one persisted Cron job can be read authoritatively.
+
+    A Cron read failure is deliberately distinct from a missing job. Callers
+    may project a confirmed removal into Record lifecycle state, but must not
+    downgrade a workflow merely because the Cron store was unavailable.
+    """
+
+    normalized = str(job_id or "").strip()
+    if not normalized:
+        return "unknown"
+    try:
+        from cron import get_job
+
+        job = get_job(normalized)
+    except Exception:
+        log.warning("Could not reconcile Record Cron job %s", normalized, exc_info=True)
+        return "unknown"
+    return "present" if isinstance(job, dict) else "missing"
+
+
 def _canonical_cron_params(params: dict[str, Any]) -> dict[str, Any]:
     """Fill every Record-owned Cron field from Hermes' maintained schema."""
 

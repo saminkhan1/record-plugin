@@ -223,7 +223,10 @@ def test_agent_run_forwards_the_host_enforced_tool_boundary():
         return {"completed": True, "failed": False}
 
     runtime.set_plugin_context(
-        SimpleNamespace(agent=SimpleNamespace(run=run))
+        SimpleNamespace(
+            profile_name="customer",
+            agent=SimpleNamespace(run=run),
+        )
     )
     allowed_tools = [
         "skills_list",
@@ -237,6 +240,8 @@ def test_agent_run_forwards_the_host_enforced_tool_boundary():
         user_message="Draft the workflow.",
         system_prompt="Submit one draft.",
         task_id="record:planner:test",
+        trace_scope="weekly-close",
+        recording_id="recording-42",
         required_tools=["record_submit_draft"],
         allowed_tools=allowed_tools,
         full_capabilities=False,
@@ -246,3 +251,15 @@ def test_agent_run_forwards_the_host_enforced_tool_boundary():
     assert calls[0]["required_tools"] == ["record_submit_draft"]
     assert calls[0]["allowed_tools"] == allowed_tools
     assert calls[0]["full_capabilities"] is False
+    assert calls[0]["observability_context"] == {
+        "name": "record.workflow.draft",
+        "session_id": "record:profile=customer:workflow=weekly-close",
+        "tags": ["record", "phase:workflow.draft"],
+        "metadata": {
+            "profile_id": "customer",
+            "workflow_id": "weekly-close",
+            "recording_id": "recording-42",
+            "correlation_id": "weekly-close:recording-42",
+            "phase": "workflow.draft",
+        },
+    }

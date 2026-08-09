@@ -1,7 +1,7 @@
 {
   "name": "record-plugin",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "start": "node scripts/dev.mjs",

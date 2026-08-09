@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import sys
+from types import SimpleNamespace
 import uuid
 from pathlib import Path
 
@@ -96,3 +98,114 @@ def test_desktop_capture_authorization_rejects_changed_recording(
     )
     with pytest.raises(HTTPException, match="does not match"):
         api.start_desktop_recording(changed)
+
+
+def test_scheduled_recording_projection_tracks_authoritative_cron_presence(
+    tmp_path,
+):
+    api = _load_plugin_api()
+    recording_dir = tmp_path / "recording"
+    recording_dir.mkdir()
+    for name in ("metadata.json", "session.json"):
+        (recording_dir / name).write_text(
+            json.dumps(
+                {
+                    "state": "scheduled",
+                    "status": "scheduled",
+                    "scheduled_job_id": "job-123",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert api._reconcile_recording_schedule(
+        recording_dir,
+        SimpleNamespace(cron_job_presence=lambda _job_id: "present"),
+        SimpleNamespace(seal_draft_revision=lambda _recording_dir: None),
+    ) == "present"
+    for name in ("metadata.json", "session.json"):
+        value = json.loads((recording_dir / name).read_text(encoding="utf-8"))
+        assert value["state"] == "scheduled"
+        assert "schedule_missing_at" not in value
+
+    seal_states = []
+    assert api._reconcile_recording_schedule(
+        recording_dir,
+        SimpleNamespace(cron_job_presence=lambda _job_id: "missing"),
+        SimpleNamespace(
+            seal_draft_revision=lambda target: seal_states.append(
+                json.loads((target / "metadata.json").read_text(encoding="utf-8"))["state"]
+            )
+        ),
+    ) == "missing"
+    assert seal_states == ["scheduled"]
+    projected = [
+        json.loads((recording_dir / name).read_text(encoding="utf-8"))
+        for name in ("metadata.json", "session.json")
+    ]
+    assert {value["state"] for value in projected} == {"needs_redraft"}
+    assert {value["status"] for value in projected} == {"needs_redraft"}
+    assert {value["scheduled_job_id"] for value in projected} == {"job-123"}
+    assert len({value["schedule_missing_at"] for value in projected}) == 1
+
+
+def test_unknown_cron_read_does_not_claim_a_scheduled_job_is_missing(tmp_path):
+    api = _load_plugin_api()
+    recording_dir = tmp_path / "recording"
+    recording_dir.mkdir()
+    for name in ("metadata.json", "session.json"):
+        (recording_dir / name).write_text(
+            json.dumps(
+                {
+                    "state": "scheduled",
+                    "status": "scheduled",
+                    "scheduled_job_id": "job-123",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert api._reconcile_recording_schedule(
+        recording_dir,
+        SimpleNamespace(cron_job_presence=lambda _job_id: "unknown"),
+        SimpleNamespace(seal_draft_revision=lambda _recording_dir: None),
+    ) == "unknown"
+    for name in ("metadata.json", "session.json"):
+        value = json.loads((recording_dir / name).read_text(encoding="utf-8"))
+        assert value["state"] == "scheduled"
+        assert "schedule_missing_at" not in value
+
+
+def test_divergent_lifecycle_projection_fails_closed_without_cron_read(tmp_path):
+    api = _load_plugin_api()
+    recording_dir = tmp_path / "recording"
+    recording_dir.mkdir()
+    (recording_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "state": "scheduled",
+                "status": "scheduled",
+                "scheduled_job_id": "job-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (recording_dir / "session.json").write_text(
+        json.dumps({"state": "drafted", "status": "drafted"}),
+        encoding="utf-8",
+    )
+
+    def unexpected_read(_job_id):
+        raise AssertionError("divergent lifecycle state queried Cron")
+
+    assert api._reconcile_recording_schedule(
+        recording_dir,
+        SimpleNamespace(cron_job_presence=unexpected_read),
+        SimpleNamespace(seal_draft_revision=lambda _recording_dir: None),
+    ) == "unknown"
+    assert json.loads(
+        (recording_dir / "metadata.json").read_text(encoding="utf-8")
+    )["state"] == "scheduled"
+    assert json.loads(
+        (recording_dir / "session.json").read_text(encoding="utf-8")
+    )["state"] == "drafted"

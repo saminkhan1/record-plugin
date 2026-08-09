@@ -19,11 +19,11 @@ const hermesHome = path.resolve(process.env.HERMES_HOME || defaultHermesHome)
 const hostRoot = path.resolve(
   process.env.HERMES_SOURCE_ROOT || path.join(repoRoot, '..', 'hermes-agent')
 )
-const hermesBin = path.resolve(
-  process.env.HERMES_BIN || path.join(os.homedir(), '.local', 'bin', 'hermes')
-)
 const hermesPython = path.resolve(
   process.env.HERMES_PYTHON || path.join(hostRoot, '.venv', 'bin', 'python')
+)
+const hermesBin = path.resolve(
+  process.env.HERMES_BIN || path.join(hostRoot, '.venv', 'bin', 'hermes')
 )
 const productVersions = validateProductVersions(repoRoot)
 const chromeIdentity = validateChromeExtensionIdentity(repoRoot)
@@ -282,15 +282,28 @@ function main() {
   })
   finishReplacement()
 
-  console.log('==> Clean-building Hermes Desktop')
+  const desktopEnv = {
+    ...process.env,
+    HERMES_HOME: hermesHome,
+    // Local Record runs must never consume a distribution certificate by
+    // electron-builder auto-discovery. Release signing is intentionally
+    // isolated behind each repository's clean-tag release command.
+    CSC_IDENTITY_AUTO_DISCOVERY: 'false',
+    CSC_NAME: '',
+    APPLE_SIGNING_IDENTITY: '',
+    HERMES_RELEASE_BUILD: '0',
+    HERMES_RELEASE_PHASE: ''
+  }
   const desktopArgs = [
-    hermesBin,
     'desktop',
     '--build-only',
     '--force-build',
-    '--hermes-root', hostRoot
+    '--local-adhoc',
+    '--hermes-root', hostRoot,
+    '--cwd', repoRoot
   ]
-  run('/bin/bash', desktopArgs, { env: { ...process.env, HERMES_HOME: hermesHome } })
+  console.log('==> Clean-building Hermes Desktop from its source checkout')
+  run(hermesBin, desktopArgs, { cwd: hostRoot, env: desktopEnv })
   if (buildOnly) {
     console.log('Record and Hermes Desktop clean build completed.')
     return
@@ -298,18 +311,19 @@ function main() {
 
   console.log('==> Launching Hermes Desktop with Record')
   const child = spawn(
-    '/bin/bash',
+    hermesBin,
     [
-      hermesBin,
       'desktop',
       '--skip-build',
+      '--local-adhoc',
       '--hermes-root', hostRoot,
       '--cwd', repoRoot
     ],
     {
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, HERMES_HOME: hermesHome }
+      cwd: hostRoot,
+      env: desktopEnv
     }
   )
   child.unref()

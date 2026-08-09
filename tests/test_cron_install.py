@@ -360,6 +360,54 @@ def test_retry_recovers_job_persisted_before_final_receipt(tmp_path, monkeypatch
     assert finalized["job_id"] == "crashwindow1"
 
 
+def test_missing_installed_job_rejects_same_revision_without_cron_dispatch(
+    tmp_path,
+    monkeypatch,
+):
+    import cron
+
+    monkeypatch.setattr(hermes, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(cron, "list_jobs", lambda include_disabled=True: [])
+    monkeypatch.setattr(cron, "get_job", lambda _job_id: None)
+    hermes._write_install_receipt(
+        hermes_home=tmp_path,
+        install_key="a" * 64,
+        receipt=hermes._cron_receipt(
+            action="created",
+            job_id="removed-job",
+            install_key="a" * 64,
+            provenance=_provenance(),
+        ),
+    )
+    monkeypatch.setattr(
+        hermes,
+        "_dispatch_cron_tool",
+        lambda _arguments: pytest.fail("same revision dispatched Cron"),
+    )
+
+    with pytest.raises(
+        hermes.HermesInstallError,
+        match="removed; create a new reviewed revision",
+    ):
+        hermes.install_workflow(
+            _payload(),
+            hermes_home=tmp_path,
+            provenance=_provenance(),
+        )
+
+
+def test_cron_presence_read_failure_is_unknown(monkeypatch):
+    import cron
+
+    monkeypatch.setattr(
+        cron,
+        "get_job",
+        lambda _job_id: (_ for _ in ()).throw(OSError("store unavailable")),
+    )
+
+    assert hermes.cron_job_presence("job-123") == "unknown"
+
+
 def test_process_death_before_cron_update_cannot_change_old_job_script_bytes(
     tmp_path, monkeypatch
 ):

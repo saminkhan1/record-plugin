@@ -313,6 +313,8 @@ def author_workflow(
             try:
                 run_result = run_agent(
                     task_id=task_id,
+                    trace_scope=workflow_id,
+                    recording_id=recording_dir.name,
                     system_prompt=_planner_system_prompt(),
                     user_message=_planner_user_message(
                         instructions=instructions,
