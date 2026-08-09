@@ -651,10 +651,17 @@ def _candidate_artifacts(candidate: Any, conversation: dict[str, Any] | None = N
     build_review = Path(str(build.get("build_dir") or "")) / "review.md"
     if build_review.is_file():
         review_markdown = build_review.read_text(encoding="utf-8")
+    session = read_json(candidate.recording_dir / "session.json")
+    session["state"] = "drafted"
+    session["status"] = "drafted"
+    for key in ("drafted_at", "draft_revision"):
+        if candidate.metadata.get(key) is not None:
+            session[key] = candidate.metadata[key]
     artifacts = [
         (candidate.output, (json.dumps(candidate.workflow, indent=2, sort_keys=True) + "\n").encode("utf-8")),
         (candidate.recording_dir / "draft-review.md", review_markdown.encode("utf-8")),
         (candidate.recording_dir / "metadata.json", (json.dumps(candidate.metadata, indent=2, sort_keys=True) + "\n").encode("utf-8")),
+        (candidate.recording_dir / "session.json", (json.dumps(session, indent=2, sort_keys=True) + "\n").encode("utf-8")),
     ]
     if conversation is not None:
         artifacts.append((

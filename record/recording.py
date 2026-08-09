@@ -227,6 +227,7 @@ def build_draft_candidate(
     )
     output = output.expanduser().resolve()
     manifest["state"] = "drafted"
+    manifest["status"] = "drafted"
     manifest["drafted_at"] = utc_now()
     return DraftCandidate(
         recording_dir=root,

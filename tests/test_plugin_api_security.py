@@ -209,3 +209,47 @@ def test_divergent_lifecycle_projection_fails_closed_without_cron_read(tmp_path)
     assert json.loads(
         (recording_dir / "session.json").read_text(encoding="utf-8")
     )["state"] == "drafted"
+
+
+def test_draft_artifacts_project_both_lifecycle_files_to_drafted(tmp_path):
+    api = _load_plugin_api()
+    recording_dir = tmp_path / "recording"
+    recording_dir.mkdir()
+    (recording_dir / "session.json").write_text(
+        json.dumps(
+            {
+                "state": "needs_redraft",
+                "status": "needs_redraft",
+                "scheduled_job_id": "old-job",
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidate = SimpleNamespace(
+        recording_dir=recording_dir,
+        output=recording_dir / "workflow.json",
+        workflow={"review": {"draft_revision": 2}},
+        review_markdown="# Review\n",
+        metadata={
+            "state": "drafted",
+            "status": "drafted",
+            "drafted_at": "2026-08-09T01:00:00Z",
+            "draft_revision": 2,
+        },
+    )
+
+    artifacts = {
+        path.name: json.loads(content)
+        for path, content in api._candidate_artifacts(candidate)
+        if path.suffix == ".json"
+    }
+
+    assert artifacts["metadata.json"]["state"] == "drafted"
+    assert artifacts["metadata.json"]["status"] == "drafted"
+    assert artifacts["session.json"] == {
+        "state": "drafted",
+        "status": "drafted",
+        "scheduled_job_id": "old-job",
+        "drafted_at": "2026-08-09T01:00:00Z",
+        "draft_revision": 2,
+    }
