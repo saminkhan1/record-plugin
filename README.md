@@ -1,18 +1,60 @@
 # Record
 
-Record is a standalone extension for stock Hermes Agent. On Apple-
-silicon macOS it records one demonstrated Mac + Chrome workflow, drafts it
-with the Hermes profile currently selected in Desktop, keeps the result
-reviewable, and installs the reviewed result as a standard Hermes Cron job.
+> **Demonstrate Mac + Chrome workflows, review drafted steps, and install automated Hermes Agent jobs.**
 
-Record never creates, names, or owns Hermes profiles. A normal installation
-uses Hermes' existing default home. If the user has already selected a named
-profile in stock Hermes, Record can follow that existing selection, but it
-will fail rather than create a missing profile.
+Record is a standalone extension for stock Hermes Agent. On Apple-silicon macOS it records demonstrated Mac + Chrome workflows, drafts repeatable automation steps using the Hermes profile currently selected in Desktop, keeps every draft transparently reviewable, and installs the reviewed result directly as a standard Hermes Cron job or dynamic webhook trigger.
 
-Desktop is the only Workflows launch surface. The dashboard directory exists
-only because Hermes mounts the profile-scoped backend routes declared there;
-it does not ship a second Workflows page.
+---
+
+## Key Components
+
+- **🖥️ Hermes Recorder Service**: Native Apple-silicon daemon signed with Developer ID; records screen and user events with secure-input privacy protection.
+- **🌐 Record Chrome Provider**: Manifest V3 Chrome extension and native-messaging bridge capturing DOM interactions, navigations, and downloads during active recordings ([Documentation](chrome_capture/extension/README.md)).
+- **📱 Desktop Plugin**: Native Hermes Desktop ESM plugin providing the Workflows review and approval surface.
+- **⚙️ Drafting & Compiler Engine**: Translates demonstrated multimodal traces into typed Hermes task actions via `ctx.llm`.
+
+---
+
+## Workflow Lifecycle
+
+```text
+┌───────────────────────┐
+│ 1. Demonstrate        │  Mac Screen + Chrome Provider capture actions & DOM evidence
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│ 2. Seal & Ingest      │  Cryptographic recording seal; redact credentials & passwords
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│ 3. Draft              │  Synthesize structured actions via selected profile's ctx.llm
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│ 4. Review & Verify    │  Human inspects exact commands, parameters, and capabilities
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│ 5. Install & Execute  │  Stock Hermes Cron schedule or signed webhook dynamic ingress
+└───────────────────────┘
+```
+
+---
+
+## Quick Navigation
+
+- [Product Boundary](#product-boundary)
+- [Installed Layout](#installed-layout)
+- [Record Chrome Provider](#chrome-provider)
+- [Requirements](#requirements)
+- [Quick Start & Local Development](#quick-start)
+- [Build the Mac Package](#build-the-mac-package)
+- [Installation Guide](#install)
+- [Profiles, Cron, Approvals, & Langfuse](#profiles-cron-approvals-and-langfuse)
+- [Runtime Data](#runtime-data)
+- [Testing & Validation](#implementation-validation)
+
+---
 
 ## Product boundary
 
@@ -166,11 +208,20 @@ npm run build
 Build the complete release-gated arm64 package:
 
 ```bash
+npm run check:versions
 export HERMES_RELEASE_BUILD=1
 export APPLE_TEAM_ID='TEAMID'
 export HERMES_RECORDER_SIGNING_IDENTITY='Developer ID Application: Example (TEAMID)'
 npm run package:mac
 ```
+
+`check:versions` requires the package, backend plugin, dashboard, Desktop
+plugin, recorder bundle, and recorder protocol to carry the same Record
+version. Release mode additionally requires a clean checkout whose `HEAD` is
+tagged exactly `v<version>`. The native and outer package manifests retain that
+commit and tag, and packaging rechecks the source after copying every runtime
+file. The Chrome Provider has its own Store version and remains independently
+versioned.
 
 If exactly one Developer ID Application identity is available, the build can
 select it automatically. Otherwise it asks for the explicit identity. The
@@ -295,11 +346,15 @@ routes reload. Hermes Desktop watches its primary profile's
 
 ## Chrome provider
 
-The packaged extension source is under the selected profile home:
+The **Record Chrome Provider** captures demonstrated user actions and DOM evidence in Google Chrome exclusively while a local macOS Record session is active. See the full [Record Chrome Provider Documentation](chrome_capture/extension/README.md) for architecture, security safeguards, and tests.
+
+The packaged extension source is located under:
 
 ```text
-$PROFILE_HOME/plugins/record/chrome_capture/extension
+chrome_capture/extension/
 ```
+
+### Installation & Registration
 
 The install path registers the manifest's fixed, assigned Web Store identity
 and allows only that extension origin in Chrome's native-messaging manifest.
@@ -307,6 +362,16 @@ Restart Chrome after first registration. During local extension development,
 the same directory can be loaded with Chrome's **Load unpacked** flow; its
 manifest key preserves the same extension ID and therefore the same native-
 host allow-list.
+
+### Extension Development & Testing
+
+```bash
+# Run Chrome capture extension tests
+npm run test:chrome
+
+# Package extension into deterministic release ZIP for Chrome Web Store
+npm run package:chrome
+```
 
 The global launcher discovers current installed plugin copies when Chrome
 starts it. Removing the profile that originally performed Chrome registration
@@ -348,11 +413,14 @@ the bundled Langfuse plugin remains the sole trace client and store.
 
 Desktop supports both time-backed and event-backed jobs. Record does not add a
 second receiver: it installs a reviewed dynamic subscription into Hermes'
-profile-scoped, HMAC-authenticated webhook surface.
+HMAC-authenticated webhook surface. For 0.1.2, webhook activation is limited to
+the Default profile because Hermes' shared multiplex gateway does not yet
+hot-reload isolated named-profile subscription registries. Scheduled workflows
+remain available in every supported local profile.
 Matching deliveries use Hermes' native event filtering, replay protection,
 payload templating, skill loading, agent sessions, and delivery behavior.
-Cron continues to own only time-backed workflows. Desktop reports the selected
-profile's receiver readiness and refuses activation until the gateway's
+Cron continues to own only time-backed workflows. Desktop reports named-profile
+webhooks as unavailable and, in Default, refuses activation until the gateway's
 webhook receiver is live.
 
 ## Runtime data
