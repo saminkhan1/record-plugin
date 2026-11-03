@@ -22,6 +22,8 @@
   let captureAuthorityRevision = -1;
   let captureAuthorityPort = null;
 
+  let cachedSemantics = null;
+  let cachedSemanticsUrl = "";
   function clearPendingCapture() {
     clearTimeout(scrollTimer);
     scrollTimer = null;
@@ -30,6 +32,8 @@
     for (const pending of pendingTypes.values()) clearTimeout(pending.timer);
     pendingTypes.clear();
     pastedTargets = new WeakSet();
+    cachedSemantics = null;
+    cachedSemanticsUrl = "";
   }
 
   function disconnectAuthorityPort() {
@@ -117,9 +121,42 @@
     return [event.metaKey && "meta", event.ctrlKey && "control", event.altKey && "alt", event.shiftKey && "shift"].filter(Boolean);
   }
   function originFor(url) { try { return new URL(url || "").origin; } catch { return ""; } }
+  function extractPageSemantics() {
+    if (cachedSemantics && cachedSemanticsUrl === location.href) return cachedSemantics;
+    try {
+      const h1 = document.querySelector("h1");
+      const heading = h1 ? cap(h1.innerText || h1.textContent || "", 120) : "";
+      const metaDesc = document.querySelector('meta[name="description"]')?.getAttribute("content");
+      const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content");
+
+      const ldScripts = document.querySelectorAll('script[type="application/ld+json"]');
+      const ldTypes = [];
+      for (const script of Array.from(ldScripts).slice(0, 5)) {
+        try {
+          const parsed = JSON.parse(script.textContent || "");
+          const type = parsed?.["@type"];
+          if (typeof type === "string") ldTypes.push(type);
+          else if (Array.isArray(type)) ldTypes.push(...type);
+        } catch {}
+      }
+
+      const semantics = {};
+      if (heading) semantics.heading = heading;
+      if (metaDesc) semantics.description = cap(metaDesc, 160);
+      if (ogTitle) semantics.og_title = cap(ogTitle, 120);
+      if (ldTypes.length) semantics.ld_types = [...new Set(ldTypes)].slice(0, 5);
+      cachedSemantics = semantics;
+      cachedSemanticsUrl = location.href;
+      return cachedSemantics;
+    } catch {
+      return {};
+    }
+  }
+
   function framePayload() {
     let topUrl = "";
     try { topUrl = window.top === window ? location.href : window.top.location.href; } catch { topUrl = ""; }
+    const semantics = extractPageSemantics();
     return {
       url: topUrl || location.href,
       origin: originFor(topUrl || location.href),
@@ -127,6 +164,7 @@
       frame_url: location.href,
       top_url: topUrl || location.href,
       viewport: { width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1 },
+      ...(Object.keys(semantics).length > 0 ? { semantics } : {}),
     };
   }
   function nearestTarget(node) {
@@ -134,16 +172,110 @@
     return node.closest(INTERACTIVE_SELECTOR) || node;
   }
   function selectorLiteral(value) { return CSS.escape(String(value || "")); }
+  function resolveLabelledBy(el) {
+    if (!(el instanceof Element)) return "";
+    const labelledBy = el.getAttribute("aria-labelledby");
+    if (!labelledBy) return "";
+    const ids = labelledBy.split(/\s+/).filter(Boolean);
+    const parts = [];
+    for (const id of ids) {
+      const ref = document.getElementById(id);
+      if (ref) {
+        const text = cap(ref.innerText || ref.textContent || "", 80);
+        if (text) parts.push(text);
+      }
+    }
+    return parts.join(" ");
+  }
+
+  function resolveAssociatedLabel(el) {
+    if (!(el instanceof Element)) return "";
+    if (el.labels && el.labels.length) {
+      const texts = Array.from(el.labels).map((lbl) => cap(lbl.innerText || lbl.textContent || "", 80)).filter(Boolean);
+      if (texts.length) return texts.join(" ");
+    }
+    if (el.id) {
+      try {
+        const labelEl = document.querySelector(`label[for="${selectorLiteral(el.id)}"]`);
+        if (labelEl) {
+          const text = cap(labelEl.innerText || labelEl.textContent || "", 80);
+          if (text) return text;
+        }
+      } catch {}
+    }
+    const parentLabel = el.closest ? el.closest("label") : null;
+    if (parentLabel) {
+      const text = cap(parentLabel.innerText || parentLabel.textContent || "", 80);
+      if (text) return text;
+    }
+    return "";
+  }
+
+  function resolveFieldsetLegend(el) {
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el instanceof HTMLButtonElement)) {
+      return "";
+    }
+    const fieldset = el.closest ? el.closest("fieldset") : null;
+    if (fieldset) {
+      const legend = fieldset.querySelector("legend");
+      if (legend) {
+        return cap(legend.innerText || legend.textContent || "", 80);
+      }
+    }
+    return "";
+  }
+
+  function semanticLandmark(el) {
+    if (!(el instanceof Element)) return "";
+    const landmark = el.closest ? el.closest("dialog, [role='dialog'], [role='alertdialog'], nav, [role='navigation'], main, [role='main'], header, [role='banner'], footer, [role='contentinfo'], aside, [role='complementary']") : null;
+    if (!landmark) return "";
+    const role = landmark.getAttribute("role") || landmark.tagName.toLowerCase();
+    const label = landmark.getAttribute("aria-label") || resolveLabelledBy(landmark) || "";
+    return label ? `${role}[${cap(label, 40)}]` : role;
+  }
+
+  function readableText(el) {
+    if (!(el instanceof Element)) return "";
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel) return cap(ariaLabel);
+    const labelledBy = resolveLabelledBy(el);
+    if (labelledBy) return cap(labelledBy);
+    const associatedLabel = resolveAssociatedLabel(el);
+    if (associatedLabel) return cap(associatedLabel);
+    const title = el.getAttribute("title");
+    if (title) return cap(title);
+    const placeholder = el.getAttribute("placeholder");
+    if (placeholder) return cap(placeholder);
+    const alt = el.getAttribute("alt");
+    if (alt) return cap(alt);
+    return cap(el.innerText || el.textContent || "");
+  }
+
   function stableSelectors(el) {
     if (!(el instanceof Element)) return [];
     const selectors = [];
     if (el.id) selectors.push(`#${selectorLiteral(el.id)}`);
-    const testId = el.getAttribute("data-testid");
-    if (testId) selectors.push(`[data-testid="${selectorLiteral(testId)}"]`);
+    for (const attr of ["data-testid", "data-test", "data-cy", "data-qa", "data-automation-id"]) {
+      const val = el.getAttribute(attr);
+      if (val) {
+        selectors.push(`[${attr}="${selectorLiteral(val)}"]`);
+        break;
+      }
+    }
     const name = el.getAttribute("name");
+    const form = el instanceof HTMLFormElement ? null : (el.form || (el.closest ? el.closest("form") : null));
+    if (form && name) {
+      if (form.id) {
+        selectors.push(`form#${selectorLiteral(form.id)} [name="${selectorLiteral(name)}"]`);
+      } else if (form.getAttribute("name")) {
+        selectors.push(`form[name="${selectorLiteral(form.getAttribute("name"))}"] [name="${selectorLiteral(name)}"]`);
+      }
+    }
     if (name) selectors.push(`${el.tagName.toLowerCase()}[name="${selectorLiteral(name)}"]`);
     const aria = el.getAttribute("aria-label");
     if (aria) selectors.push(`${el.tagName.toLowerCase()}[aria-label="${selectorLiteral(aria)}"]`);
+    const placeholder = el.getAttribute("placeholder");
+    if (placeholder) selectors.push(`${el.tagName.toLowerCase()}[placeholder="${selectorLiteral(placeholder)}"]`);
     const role = el.getAttribute("role");
     const label = readableText(el);
     if (role && label) selectors.push(`[role="${selectorLiteral(role)}"][aria-label="${selectorLiteral(label)}"]`);
@@ -168,15 +300,14 @@
       return { tag: el.tagName.toLowerCase(), id: el.id || "", role: el.getAttribute("role") || "", label: cap(el.getAttribute("aria-label") || el.getAttribute("title") || "", 80) };
     });
   }
-  function readableText(el) {
-    if (!(el instanceof Element)) return "";
-    return cap(el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("placeholder") || el.getAttribute("alt") || el.innerText || el.textContent || "");
-  }
   function targetPayload(node, event = null) {
     const el = nearestTarget(node);
     if (!el) return {};
     const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
     const selectors = stableSelectors(el);
+    const landmark = semanticLandmark(el);
+    const legend = resolveFieldsetLegend(el);
+    const form = el instanceof HTMLFormElement ? el : (el.form || (el.closest ? el.closest("form") : null));
     return {
       selector: selectors[0] || "",
       selectors,
@@ -186,13 +317,16 @@
       label: readableText(el),
       name: el.getAttribute("name") || "",
       id: el.id || "",
-      test_id: el.getAttribute("data-testid") || "",
+      test_id: el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-cy") || el.getAttribute("data-qa") || "",
       href: el instanceof HTMLAnchorElement ? el.href : "",
       aria_controls: el.getAttribute("aria-controls") || "",
       aria_expanded: el.getAttribute("aria-expanded") || "",
       content_editable: el instanceof HTMLElement ? !!el.isContentEditable : false,
       rect: rect ? { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } : {},
       shadow_path: event ? shadowPath(event) : [],
+      ...(landmark ? { landmark } : {}),
+      ...(legend ? { group_label: legend } : {}),
+      ...(form ? { form_id: form.id || "", form_name: form.getAttribute("name") || "" } : {}),
     };
   }
   function implicitRole(el) {
@@ -303,6 +437,56 @@
     }
     queueType(event);
   }, captureListenerOptions);
+  function extractFormSummary(form) {
+    if (!(form instanceof HTMLFormElement)) return null;
+    const fields = [];
+    const elements = form.elements ? Array.from(form.elements) : Array.from(form.querySelectorAll("input, textarea, select"));
+    for (const control of elements) {
+      if (!(control instanceof Element)) continue;
+      if (control instanceof HTMLButtonElement || (control instanceof HTMLInputElement && ["submit", "reset", "button", "image"].includes(control.type))) {
+        continue;
+      }
+      const name = control.getAttribute("name");
+      if (!name || name === "submit" || name === "reset") continue;
+
+      const isPassword = secureField(control);
+      const label = readableText(control);
+      const tag = control.tagName.toLowerCase();
+      const type = control.getAttribute("type") || (tag === "select" ? "select" : tag === "textarea" ? "textarea" : "text");
+
+      let val = "";
+      let checked;
+      if (isPassword) {
+        val = "[REDACTED]";
+      } else if (control instanceof HTMLInputElement && ["checkbox", "radio"].includes(control.type)) {
+        checked = control.checked;
+        val = control.value;
+      } else if (control instanceof HTMLSelectElement) {
+        val = control.value;
+      } else if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+        val = cap(control.value, 500);
+      }
+
+      fields.push({
+        name,
+        type,
+        label,
+        value: val,
+        ...(checked !== undefined ? { checked } : {}),
+        required: control.hasAttribute("required"),
+      });
+    }
+
+    return {
+      id: form.id || "",
+      name: form.getAttribute("name") || "",
+      action: form.action || "",
+      method: String(form.method || "get").toUpperCase(),
+      field_count: fields.length,
+      fields,
+    };
+  }
+
   document.addEventListener("change", (event) => {
     if (!captureAuthorityActive) return;
     if (isTextField(event.target)) {
@@ -310,11 +494,22 @@
       return;
     }
     if (secureField(event.target)) action("change", event, { input: { redacted: true, secure_input: true } });
-    else action("change", event, { input: {
-      value: fieldValue(event.target),
-      checked: event.target instanceof HTMLInputElement && ["checkbox", "radio"].includes(event.target.type) ? event.target.checked : undefined,
-      selected_items: event.target instanceof HTMLSelectElement ? Array.from(event.target.selectedOptions).map((item) => item.value) : [],
-    } });
+    else {
+      const isSelect = event.target instanceof HTMLSelectElement;
+      const selectedOptions = isSelect
+        ? Array.from(event.target.selectedOptions).map((item) => ({
+            value: item.value,
+            label: cap(item.text || item.label || ""),
+          }))
+        : [];
+      action("change", event, { input: {
+        value: fieldValue(event.target),
+        checked: event.target instanceof HTMLInputElement && ["checkbox", "radio"].includes(event.target.type) ? event.target.checked : undefined,
+        selected_items: isSelect ? selectedOptions.map((o) => o.value) : [],
+        selected_texts: isSelect ? selectedOptions.map((o) => o.label).filter(Boolean) : [],
+        selected_options: selectedOptions,
+      } });
+    }
   }, captureListenerOptions);
   document.addEventListener("submit", (event) => {
     if (!captureAuthorityActive) return;
@@ -330,8 +525,25 @@
       formAction: form?.action || "",
       pageUrl,
     }) || form?.action || pageUrl;
+
+    const submitter = event.submitter instanceof Element ? {
+      tag: event.submitter.tagName.toLowerCase(),
+      type: event.submitter.getAttribute("type") || "submit",
+      name: event.submitter.getAttribute("name") || "",
+      value: event.submitter.getAttribute("value") || "",
+      label: readableText(event.submitter),
+      id: event.submitter.id || "",
+    } : null;
+
+    const formSummary = form ? extractFormSummary(form) : null;
+
     action("submit", event, {
-      target: { href: destination, form_method: String(form?.method || "get").toUpperCase() },
+      target: {
+        href: destination,
+        form_method: String(form?.method || "get").toUpperCase(),
+        ...(submitter ? { submitter } : {}),
+        ...(formSummary ? { form_summary: formSummary } : {}),
+      },
       effect: { side_effect: true, before_url: pageUrl },
     });
   }, captureListenerOptions);
@@ -393,6 +605,8 @@
 
   function emitNavigate(before, after, reason) {
     if (!captureAuthorityActive) return;
+    cachedSemantics = null;
+    cachedSemanticsUrl = "";
     emit("hcc-trace-action", { ts: ts(), kind: "navigate", payload: { browser: framePayload(), effect: { before_url: before || "", after_url: after || location.href }, meta: { reason, correlation_id: correlationId() } }, quality: { confidence: "high", warnings: [] } });
   }
   const originalPushState = history.pushState;
